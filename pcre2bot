@@ -1,0 +1,700 @@
+#!/usr/bin/env perl
+#
+# pcre2bot — pcre2test IRC bot
+#
+# Description:
+#   IRC bot that listens to specific user commands in a IRC channel, sends them
+#   to pcre2test's input, then run regex tests and outputs them in the channel.
+#
+# References:
+#   https://www.rfc-editor.org/rfc/rfc1459
+#   https://modern.ircdocs.horse/
+#   https://en.wikipedia.org/wiki/IRC
+#   https://www.perl.com/pub/2004/07/02/poeintro.html/
+#
+# Contributors:
+#   OnlineCop
+#
+# Aknowledgements:
+#   - https://metacpan.org/pod/POE
+#   - https://metacpan.org/pod/POE::Component::IRC
+#   - https://github.com/geirha/shbot
+#   - https://github.com/perlbot/perlbuut
+#   - https://wooledge.org/~greybot/
+#   - https://github.com/troydm/shellbot
+#   - BinGOs, Mathizen, and folks from #perl on libera (vague, huf, Grinnz),
+#     OnlineCop #regex on libera.
+#
+# Notes:
+#   - Unfortunately to get TLS support, POE::Component::SSLify has to be force
+#     installed because it's failing the tests.
+#     Net::SSLeay also is failing its tests.
+#
+# TODO:
+#   - Study the IRC protocol basics.
+#   - Study POE, and POE::Component::IRC, Mojo::IRC, AnyEvent::IRC.
+#   - Study perlbot, shbot, and greybot to get ideias of useful features to implement.
+#
+#   - Think of ways of securing the bot e.g. sandboxing using virtualization,
+#     linux namespaces, containers, etc.
+#     Will pcre2test need to be limited to avoid abuse? Or use a configuration file
+#     to let the user choose.
+#     Ignore private messages from non-channel users with umode +G to avoid abuse?
+#     +G is a Libera specific user mode, so do not set it by default but in configuration.
+#     Perhaps a rate limit is better than ignoring all pms? The bot also should
+#     be rate limited to avoid spam/flood. WeeChat uses 2 seconds in irc.server_default.anti_flood
+#     option.
+#
+#   - Add configuration file.
+#   - Figure out how the nick passwords should be handled. Perhaps store a password
+#     hash in config file, then decrypt it in the script?
+#     It has to support interactive use, so 'pass' can be used.
+#   - Add bot logging, configurable by the user. Log only relevant events that
+#     has relation with bot nick, e.g. privmsg messages, kick, ban, errors, etc.
+#   - Study simpleclient.pl on how it accepts user inputs, so bot can be interactive.
+#   - Perhaps add daemon functionality.
+#   - Study ways of how the bot can be deployed in a server.
+#   - After POE script is done, try to reimplement it with a framework that supports
+#     TLS, i.e. Mojo::IRC. It would be neat to use a self-signed cert to avoid
+#     passwords.
+#   - When bot is finished and stable, ask for permission on libera.#regex to have
+#     it +v.
+
+use strict;
+use warnings;
+
+use File::Basename;
+use POE qw<
+            Wheel::Run
+            Component::IRC
+            Component::IRC::Plugin::NickServID
+            Component::IRC::Plugin::Connector
+            Component::Curl::Multi
+        >;
+use HTTP::Request::Common qw< POST >;
+use Data::Dumper          qw< Dumper >;
+
+
+END { close STDOUT or die $! }
+
+my $prog     = basename $0;
+my $prog_ver = '1.0';
+
+$|++;  # Disable STDOUT buffering.
+
+# Check if pcre2test is installed on user's system.
+sub check_pcre2test
+{
+    # Exit with an error if pcre2test is not found on $PATH.
+    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
+
+    if (($? >> 8) > 0) {
+        print STDERR "${prog}: pcre2test is not installed\n";
+        exit 1;
+    }
+}
+
+check_pcre2test();
+
+# Configuration
+my $nickname = 'pcre2bot';
+my $ircname  = 'ryoskzypu';
+my $server   = 'irc.libera.chat';
+my $port     = '6697';
+my $umode    = '+IG';
+my @channels = (
+    '#regex',
+    '#ryoskzypu',
+    '#pcre2bot',
+);
+
+# Hardcoding passwords in plaintext is bad. It's temporary just for pre-alpha release.
+my $password = '';
+
+my @allow_list = (
+    qw<
+    >
+);
+
+my @ignore_list = (
+    qw<
+    >
+);
+
+# pcre2test's output lines
+my @lines;         # Count
+my $max_lines = 5;
+
+# Pastebin services
+#
+# Note that the services must accept HTTP POST requests with a file form field,
+# and return a URL of its paste.
+#
+# TODO: Perhaps add netcat logic, so services that rely on 'nc' can be used.
+
+# Primary service
+my $url = 'https://paste.c-net.org/',
+
+# Fallback services
+my @urls = (
+    'https://0x0.st/',
+);
+
+# Create a new PoCo-IRC object.
+my $irc = POE::Component::IRC->spawn(
+   nick         => $nickname,
+   ircname      => $ircname,
+   server       => $server,
+   port         => $port,
+   debug        => 1,
+   plugin_debug => 1,
+   UseSSL       => 1,
+   Port         => 6697,
+) or die "failed to create PoCo-IRC object $!";
+
+POE::Session->create(
+    package_states => [
+        #main => [qw(_default _start irc_001 irc_identified irc_public)],
+        #main => [qw(_start irc_001 irc_identified irc_public)],
+        main => [
+            qw<
+                _start
+                irc_identified
+                irc_public
+                irc_msg
+                got_child_stdout
+                got_child_stderr
+                got_child_close
+                got_child_signal
+                _response
+            >
+        ],
+    ],
+
+    heap => {irc => $irc},
+);
+
+my $curl = POE::Component::Curl::Multi->spawn(
+    alias           => 'curl',
+    timeout         => 15,
+    agent           => 'curl/8.12.1',
+    max_concurrency => 10,
+);
+
+$poe_kernel->run();
+
+# Start handler
+sub _start
+{
+    my $heap = $_[HEAP];
+    my $irc = $heap->{irc};
+
+    # Keep bot connected to the IRC server on disconnects.
+    $heap->{connector} = POE::Component::IRC::Plugin::Connector->new();
+    $irc->plugin_add('Connector' => $heap->{connector});
+
+    $irc->plugin_add('NickServID', POE::Component::IRC::Plugin::NickServID->new(
+        'Password' => $password
+    ));
+    $irc->yield(register => 'all');
+    $irc->yield(connect  => {});
+
+    return;
+}
+
+# Run pcre2test
+sub run_pcre2test
+{
+    my ($kernel, $heap, $version, $pat_mod, $subj_mod, $input) = @_;
+    my $program;
+
+    if ($version) {
+        $program = ['pcre2test', '-q', '--version'];
+    }
+    else {
+        $program = ['pcre2test', '-q', '-pattern', $pat_mod, '-subject', $subj_mod];
+    }
+
+    my $child = POE::Wheel::Run->new(
+        Program     => $program,
+        StdoutEvent => 'got_child_stdout',
+        StderrEvent => 'got_child_stderr',
+        CloseEvent  => 'got_child_close',
+    );
+
+    # Send input to pcre2test.
+    $child->put($input);
+
+    $kernel->sig_child($child->PID, 'got_child_signal');
+
+    # Wheel events include the wheel's ID.
+    $heap->{children_by_wid}{$child->ID} = $child;
+
+    # Signal events include the process ID.
+    $heap->{children_by_pid}{$child->PID} = $child;
+
+    print(
+        "Child pid ", $child->PID,
+        " started as wheel ", $child->ID, ".\n"
+    );
+}
+
+# Handle pcre2test's STDOUT events.
+sub got_child_stdout
+{
+    my ($stdout_line, $wheel_id) = @_[ARG0, ARG1];
+
+    my $child    = $_[HEAP]{children_by_wid}{$wheel_id};
+    my $heap     = $_[HEAP];
+    my $channel  = $heap->{input_chann};
+    my $irc      = $heap->{irc};
+    my $nick     = $heap->{nick};
+    my $line_cnt = scalar @lines;
+
+    print "pid ", $child->PID, " STDOUT: $stdout_line\n";
+
+    # Last output line.
+    if ($stdout_line eq '') {
+        print "\$line_cnt $line_cnt\n";
+
+        # Send output to a pastebin service, if line count exceeds the limit.
+        if ($line_cnt > $max_lines + 1) {
+            my $input = join "\n", @lines;
+            $heap->{input} = $input;
+
+            get_pastebin($input);
+        }
+
+        # Reset
+        @lines = ();
+    }
+    else {
+        print "\$line_cnt $line_cnt\n";
+
+        # Count all lines except the version line from command.
+        push @lines, $stdout_line if $stdout_line !~ /\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
+
+        if ($heap->{trigger} =~ /\A(?>default|callouts)\z/ && $line_cnt < $max_lines + 1) {
+            # Ignore the first 2 lines if the trigger is a default or callout,
+            # because pattern/subject is already known to the user.
+            return if $line_cnt =~ /\A[01]\z/;
+
+            # Send output to the channel.
+            $irc->yield(privmsg => $channel, "${nick}$stdout_line");
+        }
+        elsif ($heap->{trigger} =~ /\A(?>verbose)\z/ && $line_cnt < $max_lines - 1) {
+            $irc->yield(privmsg => $channel, "${nick}$stdout_line");
+        }
+    }
+}
+
+# Handle pcre2test's STDERR events.
+sub got_child_stderr
+{
+    my ($stderr_line, $wheel_id) = @_[ARG0, ARG1];
+    my $child = $_[HEAP]{children_by_wid}{$wheel_id};
+
+    print "pid ", $child->PID, " STDERR: $stderr_line\n";
+}
+
+# Handle pcre2test's close events.
+sub got_child_close
+{
+    my $wheel_id = $_[ARG0];
+    my $child    = delete $_[HEAP]{children_by_wid}{$wheel_id};
+
+    # May have been reaped by on_child_signal().
+    unless (defined $child) {
+        print "wid $wheel_id closed all pipes.\n";
+        return;
+    }
+
+    print "pid ", $child->PID, " closed all pipes.\n";
+    delete $_[HEAP]{children_by_pid}{$child->PID};
+}
+
+# Handle pcre2test's signal events.
+sub got_child_signal
+{
+    print "pid $_[ARG1] exited with status $_[ARG2].\n";
+    my $child = delete $_[HEAP]{children_by_pid}{$_[ARG1]};
+
+    # May have been reaped by on_child_close().
+    return unless defined $child;
+    delete $_[HEAP]{children_by_wid}{$child->ID};
+}
+
+# Event: server welcome message
+#sub irc_001
+#{
+#    my $sender = $_[SENDER];
+#
+#    # Since this is an irc_* event, we can get the component's object by
+#    # accessing the heap of the sender. Then we register and connect to the
+#    # specified server.
+#    my $irc = $sender->get_heap();
+#    print 'Connected to ', $irc->server_name(), "\n";
+#
+#    return;
+#}
+
+# Only join channels when nick is identified by NickServ, so the hostname is not
+# exposed before a cloak is set.
+sub irc_identified
+{
+    my $sender = $_[SENDER];
+    my $irc = $sender->get_heap();
+
+    print "Nick is identified, joining channels.\n";
+
+    $irc->yield(mode => "$nickname $umode") if $umode ne '';
+    $irc->yield(join => $_) foreach @channels;
+}
+
+# Parse PRIVMSG before sending it to pcre2test.
+#
+# Usage:
+#   trigger> /pattern/modifiers subject
+#            s/pattern/replacement/modifiers subject
+#
+#   nick: command
+#
+# Commands are put after the bot nick with an optional colon or comma suffix.
+#
+# Triggers:
+#   re>        show default output
+#   rec>       "    callouts
+#   rev>       "    verbose callouts
+#
+# Commands:
+#   help       show help
+#   version    "    PCRE2 version
+#
+# Examples:
+#   re> /(?<=ab)c/ abc
+#   pcre2bot: version
+#
+# Notes:
+#   - The trigger's pattern and subject must be separated by a space, since newlines
+#     on IRC terminates the message and IRC does not support multiline messages
+#     in the original spec.
+#     Thus the drawback is that 'replace=...' modifier cannot have spaces, so
+#     the s/// syntax must be used.
+#   - To avoid spam, only one subject test is allowed per pattern/trigger invocation,
+#     and pcre2test outputs that exceed the $max_lines variable are uploaded to
+#     a pastebin service.
+#   - IRC messages must have a limit of 512 bytes according to the spec, thus the
+#     the tests are also limited.
+#   - Newlines in the pattern are valid in pcre2test, but IRC is line oriented
+#     and chats must not be spammed.
+#     Also pcre2test interprets trailing newlines as subjects separators, so a
+#     '\n' escape sequence must be used for multi-line matches.
+#   - See pcre2test(1) for more details.
+#
+# TODO:
+#   - Make tests to assert if pcre2test can be abused or crash user's machine.
+#     Perhaps limit some resources and modifiers to prevent abuse.
+sub parse_privmsg
+{
+    my ($kernel, $heap, $nick, $channel, $message) = @_;
+
+    # Default options modifiers
+    my $pat_mod  = 'no_start_optimize,no_auto_possess,no_dotstar_anchor,utf';
+    my $subj_mod = 'ovector=0';
+
+    # Commands
+    if ($message =~ /
+                     \A
+                     \Q$nickname\E[:,]?
+                     \ (?>
+                         (?'cmd1' help) | (?'cmd2' version)
+                       )
+                     \z
+                /x) {
+        if (defined $+{cmd1}) {
+            $irc->yield(privmsg => $channel => "${nick}Usage: trigger> /pattern/mods subject; trigger> s/pattern/replace/mods subject; nick: command");
+            $irc->yield(privmsg => $channel => "${nick}Triggers: re> (default output), rec> (callouts), rev> (verbose callouts)");
+            $irc->yield(privmsg => $channel => "${nick}Commands: help (show help), version (PCRE2 version)");
+            $irc->yield(privmsg => $channel => "${nick}E.g. re> /(?<=ab)c/ abc; re> s/abc/<\$0>/g abc; pcre2bot: version");
+        }
+        elsif (defined $+{cmd2}) {
+            run_pcre2test($kernel, $heap, 1, '', '', '');
+        }
+    }
+    # Triggers
+    elsif ($message =~ /
+                     \A
+                     (?>
+                         (?'trig1' rev) | (?'trig2' rec) | (?'trig3' re)
+                     )
+                     >(?'input'
+                         \ (?'re_input' .++)?+
+                     )?+
+                     \z
+                 /x) {
+        my $input;
+        my $delimiter;
+        my $pattern;
+        my $modifiers;
+        my $subject;
+        my $regexp;
+
+        # Set options modifiers
+        #
+        # Note that it seems regex101 does not use 'no_auto_possess' mod, so remove
+        # it for an exact callout comparison.
+
+        # Verbose callouts
+        if (defined $+{trig1}) {
+            $pat_mod  .= ',auto_callout,info';
+            $subj_mod .= ',callout_extra';
+            #$subj_mod .= ',callout_extra,callout_capture';
+            $heap->{trigger} = 'verbose';
+        }
+        # Callouts
+        elsif (defined $+{trig2}) {
+            $pat_mod  .= ',auto_callout';
+            $heap->{trigger} = 'callouts';
+        }
+        # Default
+        elsif (defined $+{trig3}) {
+            $subj_mod .= ',callout_none';
+            $heap->{trigger} = 'default';
+        }
+
+        if (defined $+{input}) {
+            if (defined $+{re_input}) {
+                $input = $+{re_input};
+            }
+            else {
+                $irc->yield(privmsg => $channel => "${nick}missing pattern and subject");
+                return;
+            }
+        } else {
+            $irc->yield(privmsg => $channel => "${nick}missing pattern and subject");
+            return;
+        }
+
+        # Get the pattern and subject from input.
+        #
+        # Note that pcre2test allows spaces in the modifiers list, but not here
+        # since pattern and subjects must be separated by a space.
+        #
+        # TODO:
+        #   - Fix /foo\\/ that is valid and is not matching.
+        #   - Add a s/// trigger that uses pcre2 substitute function. Do not forget
+        #     to ignore 'replace=...' modifiers on it.
+        #   - '/replace= ...' also does not allow commas, so if a user use commas,
+        #     replace them with a unique char to pcre2test.
+        #   - If the pattern is not sent to a pastebin, remove the first 2 lines
+        #     of pcre2test output from default and normal callouts, because it's
+        #     redundant since pattern and subjects are already known to the user.
+        if ($input =~ /
+                          # This is for the \/match\/modifiers format only.
+                          ^\h*+
+                          (?'delimiter' [\/!"'`=_:;,%&@~-])             # Opening delimiter
+                          (?'pattern'
+                              (?> \\.
+                                  | (?!\k{delimiter}) [^\\]
+                              )*+
+                          )
+                          \k{delimiter}                                 # Closing delimiter
+
+                          (?'modifiers'(?&Modifiers))?+
+
+                          # End of pattern+modifiers; start of subject
+                          \x20++
+
+                          (?'subject'.++)
+
+                          (?(DEFINE)
+                              (?<Modifiers>
+                                  (?&Modifier_short) (?>,(?&Modifier_short))*+
+                                  (?>,(?&Modifier_long))*+
+                              |
+                                  (?&Modifier_long)
+                                  (?>,(?&Modifier_long))*+
+                              )?+
+                              (?<Modifier_long> \h*+\b
+                                  (?>allow_empty_class|allow_lookaround_bsk|allow_surrogate_escapes|alt_bsux|alt_circumflex|alt_extended_class|alt_verbnames|anchored|ascii_all|ascii_bsd|ascii_bss|ascii_bsw|ascii_digit|ascii_posix|auto_callout
+                                  |bad_escape_is_literal
+                                  |caseless|caseless_restrict
+                                  |dollar_endonly|dotall|dupnames
+                                  |endanchored|escaped_cr_is_lf|extended|extended_more|extra_alt_bsux
+                                  |firstline
+                                  |literal
+                                  |match_line|match_invalid_utf|match_unset_backref|match_word|multiline
+                                  |never_backslash_c|never_callout|never_ucp|never_utf|no_auto_capture|no_auto_possess|no_bs0|no_dotstar_anchor|no_start_optimize|no_utf_check
+                                  |python_octal
+                                  |replace
+                                  |turkish_casing
+                                  |ucp|ungreedy|use_offset_limit|utf
+                                  )\b
+
+                                  # Only some modifiers allow '=value', so if you WANT to be
+                                  # spec-compliant, you could break those out separately.
+                                  (?> =
+                                      # Allows '\ ' in 'replace=foo\ bar\ baz' to be included
+                                      (?> [^,\s\\]++ | \\[^\n,] )++
+                                  )?+
+                              )
+                              (?<Modifier_short>\h*+\b (?>[agimnrs]++|x{1,2}+)++ \b)
+                          )
+                      /x) {
+            $delimiter = $+{delimiter};
+            $pattern   = $+{pattern};
+            $modifiers = $+{modifiers};
+            $subject   = $+{subject};
+            $regexp    = "${delimiter}${pattern}${delimiter}$modifiers";
+
+            print "\$pattern: '${regexp}'\n";
+            print "\$subject '${subject}'\n";
+        }
+
+        if (! defined $regexp) {
+            $irc->yield(privmsg => $channel => "${nick}invalid pattern");
+            return;
+        }
+
+        if (! defined $subject) {
+            $irc->yield(privmsg => $channel => "${nick}missing subject string");
+            return;
+        }
+
+        # Construct a single test that is a valid pcre2test input.
+        $input = <<~_;
+            $regexp
+            $subject
+            _
+
+        # Send input to pcre2test's STDIN.
+        run_pcre2test($kernel, $heap, 0, $pat_mod, $subj_mod, $input);
+    }
+}
+
+# Check if nick is allowed to run bot commands.
+sub is_allowed
+{
+    my $nick = shift;
+
+    # Allow list has priority over the ignore list.
+    if (! @allow_list) {
+        grep { $_ eq $nick } @ignore_list ? return 0
+                                          : return 1;
+    }
+
+    return grep { $_ eq $nick } @allow_list;
+}
+
+# Reply to any PRIVMSG in channel that addresses the bot commands.
+sub irc_public
+{
+    # :ryoskzypu!~user@user/ryoskzypu PRIVMSG ##testing-weechat :pcre2bot: x
+    my ($sender, $who, $command, $message) = @_[SENDER, ARG0 .. ARG2];
+    my $nick     = (split /!/, $who)[0];
+    my $channel  = $command->[0];
+    #my $irc     = $_[SENDER]->get_heap();
+    my $heap     = $_[HEAP];
+    my $kernel   = $_[KERNEL];
+
+    $heap->{input_chann} = $channel;
+    $heap->{nick}        = "${nick}: ";
+
+    parse_privmsg($kernel, $heap, $heap->{nick}, $channel, $message) if is_allowed($nick);
+
+    return;
+}
+
+# Reply to any private PRIVMSG that addresses the bot commands.
+sub irc_msg
+{
+    # :ryoskzypu!~user@user/ryoskzypu PRIVMSG pcre2bot :pcre2bot: x
+    my ($sender, $who, undef, $message) = @_[SENDER, ARG0 .. ARG2];
+    my $nick = (split /!/, $who)[0];
+    #my $irc     = $_[SENDER]->get_heap();
+    my $heap     = $_[HEAP];
+    my $kernel   = $_[KERNEL];
+
+    $heap->{input_chann} = $nick;
+    $heap->{nick}        = '';
+
+    parse_privmsg($kernel, $heap, '', $nick, $message) if is_allowed($nick);
+
+    return;
+}
+
+# We registered for all events, this will produce some debug info.
+#sub _default
+#{
+#    my ($event, $args) = @_[ARG0 .. $#_];
+#    my @output = ("$event: ");
+#
+#    foreach my $arg (@$args) {
+#        if (ref $arg eq 'ARRAY') {
+#            push(@output, '[' . join(', ', @$arg ) . ']');
+#        }
+#        else {
+#            push (@output, "'${arg}'");
+#        }
+#    }
+#
+#    print join ' ', @output, "\n";
+#
+#    return;
+#}
+
+# Upload pcre2test's output to a pastebin service.
+sub get_pastebin
+{
+    my $input = shift;
+
+    $poe_kernel->post('curl', 'request', '_response', POST(
+            $url,
+            Content_Type => 'form-data',
+            Content => [
+                'file' => [undef, 'filename', Content_Type => 'text/plain', Content => $input],
+            ]
+    ));
+
+    return;
+}
+
+# Handle HTTP requests responses.
+sub _response
+{
+    my ($request_packet, $response_packet) = @_[ARG0, ARG1];
+    my $ret_code = $response_packet->[0]->{_rc};
+    my $content  = $response_packet->[0]->{_content};
+    $content =~ s/\n//;
+
+    my $heap    = $_[HEAP];
+    my $channel = $heap->{input_chann};
+    my $nick    = $heap->{nick};
+    my $irc     = $heap->{irc};
+    my $input   = $heap->{input};
+
+    #print Dumper $request_packet;
+    #print Dumper $response_packet;
+
+    # Success.
+    if ($ret_code == 200) {
+
+        print "${ret_code}: ${content}\n";
+
+        $irc->yield(privmsg => $channel, "${nick}etc... ( $content )");
+    }
+    # Try a fallback service.
+    else {
+        print "${ret_code}: ${content}\n";
+
+        if (! @urls) {
+            $irc->yield(privmsg => $channel, "failed to upload pcre2test's output to a pastebin service");
+            return;
+        }
+
+        $url = shift @urls;
+        get_pastebin($input);
+    }
+
+    return;
+}
