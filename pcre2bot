@@ -16,6 +16,7 @@
 #   OnlineCop
 #
 # Aknowledgements:
+#   - https://github.com/PCRE2Project/pcre2/
 #   - https://metacpan.org/pod/POE
 #   - https://metacpan.org/pod/POE::Component::IRC
 #   - https://github.com/geirha/shbot
@@ -74,41 +75,32 @@ use POE qw<
 use HTTP::Request::Common qw< POST >;
 use Data::Dumper          qw< Dumper >;
 
-
 END { close STDOUT or die $! }
 
 my $prog     = basename $0;
-my $prog_ver = '1.0';
+my $prog_ver = '0.1';
 
 $|++;  # Disable STDOUT buffering.
 
-# Check if pcre2test is installed on user's system.
-sub check_pcre2test
-{
-    # Exit with an error if pcre2test is not found on $PATH.
-    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
-
-    if (($? >> 8) > 0) {
-        print STDERR "${prog}: pcre2test is not installed\n";
-        exit 1;
-    }
-}
-
-check_pcre2test();
-
 # Configuration
-my $nickname = 'pcre2bot';
-my $ircname  = 'ryoskzypu';
-my $server   = 'irc.libera.chat';
-my $port     = '6697';
-my $umode    = '+IG';
+
+my $nickname   = 'pcre2bot';
+my $ircname    = 'ryoskzypu';
+my $umode      = '+IG';
+my $server     = 'irc.libera.chat';
+my $port       = '6697';
+my $tls        = 1;
+my $debug      = 1;
+my $debug_plug = 1;
+
 my @channels = (
-    '#regex',
+#    '#regex',
     '#ryoskzypu',
     '#pcre2bot',
 );
 
-# Hardcoding passwords in plaintext is bad. It's temporary just for pre-alpha release.
+# Hardcoding passwords in plaintext is bad. It's just temporary for testing before
+# the stable release.
 my $password = '';
 
 my @allow_list = (
@@ -140,22 +132,35 @@ my @urls = (
     'https://0x0.st/',
 );
 
-# Create a new PoCo-IRC object.
+# Regexes
+my $pcre2_ver = qr/\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
+
+# Check if pcre2test is installed on user's system.
+sub check_pcre2test
+{
+    # Exit with an error if pcre2test is not found on $PATH.
+    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
+
+    if (($? >> 8) > 0) {
+        print STDERR "${prog}: pcre2test is not installed\n";
+        exit 1;
+    }
+}
+
+# Create a PoCo-IRC object.
 my $irc = POE::Component::IRC->spawn(
    nick         => $nickname,
    ircname      => $ircname,
    server       => $server,
    port         => $port,
-   debug        => 1,
-   plugin_debug => 1,
-   UseSSL       => 1,
-   Port         => 6697,
+   UseSSL       => $tls,
+   debug        => $debug,
+   plugin_debug => $debug_plug,
 ) or die "failed to create PoCo-IRC object $!";
 
+# Create a PoCo-IRC session.
 POE::Session->create(
     package_states => [
-        #main => [qw(_default _start irc_001 irc_identified irc_public)],
-        #main => [qw(_start irc_001 irc_identified irc_public)],
         main => [
             qw<
                 _start
@@ -174,14 +179,13 @@ POE::Session->create(
     heap => {irc => $irc},
 );
 
+# Create a curl object.
 my $curl = POE::Component::Curl::Multi->spawn(
     alias           => 'curl',
     timeout         => 15,
     agent           => 'curl/8.12.1',
     max_concurrency => 10,
 );
-
-$poe_kernel->run();
 
 # Start handler
 sub _start
@@ -272,17 +276,21 @@ sub got_child_stdout
         print "\$line_cnt $line_cnt\n";
 
         # Count all lines except the version line from command.
-        push @lines, $stdout_line if $stdout_line !~ /\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
+        push @lines, $stdout_line if $stdout_line !~ $pcre2_ver;
 
-        if ($heap->{trigger} =~ /\A(?>default|callouts)\z/ && $line_cnt < $max_lines + 1) {
-            # Ignore the first 2 lines if the trigger is a default or callout,
-            # because pattern/subject is already known to the user.
-            return if $line_cnt =~ /\A[01]\z/;
+        if ($stdout_line !~ $pcre2_ver) {
+            if ($heap->{trigger} =~ /\A(?>default|callouts)\z/ && $line_cnt < $max_lines + 1) {
+                # Ignore the first 2 lines if the trigger is a default or callout,
+                # because pattern/subject is already known to the user.
+                return if $line_cnt =~ /\A[01]\z/;
 
-            # Send output to the channel.
-            $irc->yield(privmsg => $channel, "${nick}$stdout_line");
-        }
-        elsif ($heap->{trigger} =~ /\A(?>verbose)\z/ && $line_cnt < $max_lines - 1) {
+                # Send output to the channel.
+                $irc->yield(privmsg => $channel, "${nick}$stdout_line");
+            }
+            elsif ($heap->{trigger} =~ /\A(?>verbose)\z/ && $line_cnt < $max_lines - 1) {
+                $irc->yield(privmsg => $channel, "${nick}$stdout_line");
+            }
+        } else {
             $irc->yield(privmsg => $channel, "${nick}$stdout_line");
         }
     }
@@ -384,7 +392,7 @@ sub irc_identified
 #     and pcre2test outputs that exceed the $max_lines variable are uploaded to
 #     a pastebin service.
 #   - IRC messages must have a limit of 512 bytes according to the spec, thus the
-#     the tests are also limited.
+#     tests are also limited.
 #   - Newlines in the pattern are valid in pcre2test, but IRC is line oriented
 #     and chats must not be spammed.
 #     Also pcre2test interprets trailing newlines as subjects separators, so a
@@ -404,13 +412,13 @@ sub parse_privmsg
 
     # Commands
     if ($message =~ /
-                     \A
-                     \Q$nickname\E[:,]?
-                     \ (?>
-                         (?'cmd1' help) | (?'cmd2' version)
-                       )
-                     \z
-                /x) {
+                        \A
+                        \Q$nickname\E[:,]?
+                        \ (?>
+                            (?'cmd1' help) | (?'cmd2' version)
+                          )
+                        \z
+                    /x) {
         if (defined $+{cmd1}) {
             $irc->yield(privmsg => $channel => "${nick}Usage: trigger> /pattern/mods subject; trigger> s/pattern/replace/mods subject; nick: command");
             $irc->yield(privmsg => $channel => "${nick}Triggers: re> (default output), rec> (callouts), rev> (verbose callouts)");
@@ -423,15 +431,15 @@ sub parse_privmsg
     }
     # Triggers
     elsif ($message =~ /
-                     \A
-                     (?>
-                         (?'trig1' rev) | (?'trig2' rec) | (?'trig3' re)
-                     )
-                     >(?'input'
-                         \ (?'re_input' .++)?+
-                     )?+
-                     \z
-                 /x) {
+                           \A
+                           (?>
+                               (?'trig1' rev) | (?'trig2' rec) | (?'trig3' re)
+                           )
+                           >(?'input'
+                               \ (?'re_input' .++)?+
+                           )?+
+                           \z
+                       /x) {
         my $input;
         my $delimiter;
         my $pattern;
@@ -453,7 +461,7 @@ sub parse_privmsg
         }
         # Callouts
         elsif (defined $+{trig2}) {
-            $pat_mod  .= ',auto_callout';
+            $pat_mod .= ',auto_callout';
             $heap->{trigger} = 'callouts';
         }
         # Default
@@ -481,74 +489,115 @@ sub parse_privmsg
         # since pattern and subjects must be separated by a space.
         #
         # TODO:
-        #   - Fix /foo\\/ that is valid and is not matching.
+        #   - Disallow leading spaces on modifiers, so subject strings can be
+        #     parsed without clashing with modifiers that has spaces (e.g. /utf/ utf;
+        #     /a/ a). *OK*
+        #   - Restrict modifiers in an allow list that is configurable by the user.
+        #     Also backslashes can be used to allow spaces in 'replace=...', e.g.
+        #     'replace=some\ \ text Subject string'. Document it aswell.
+        #     Replace '\ ' with a space before sending it to pcre2test. *OK*
         #   - Add a s/// trigger that uses pcre2 substitute function. Do not forget
         #     to ignore 'replace=...' modifiers on it.
         #   - '/replace= ...' also does not allow commas, so if a user use commas,
         #     replace them with a unique char to pcre2test.
-        #   - If the pattern is not sent to a pastebin, remove the first 2 lines
-        #     of pcre2test output from default and normal callouts, because it's
-        #     redundant since pattern and subjects are already known to the user.
-        if ($input =~ /
-                          # This is for the \/match\/modifiers format only.
-                          ^\h*+
-                          (?'delimiter' [\/!"'`=_:;,%&@~-])             # Opening delimiter
+        #     It has to be in s/// syntax, because of the same reasons pcre2test
+        #     does not allow commas.
+        #   - Decide if '\=...' subjects modifiers should be allowed. It can be
+        #     disabled with the subject_literal modifier, however backslash interpretation
+        #     will be disabled aswell.
+        #   - Add a s/// syntax for the 'rev' trigger, so it will use substitute_callout
+        #     modifier by default.
+        if ($input =~ m{
+                          \A
+                          \h*+
+                          # This is for the /match/modifiers format only.
+                          (?'delimiter' [/!"'`=_:;,%&@~-])   # Opening delimiter
                           (?'pattern'
                               (?> \\.
                                   | (?!\k{delimiter}) [^\\]
                               )*+
                           )
-                          \k{delimiter}                                 # Closing delimiter
+                          \k{delimiter}                      # Closing delimiter
 
-                          (?'modifiers'(?&Modifiers))?+
+                          (?'modifiers' (?&get_modifiers))?+
 
-                          # End of pattern+modifiers; start of subject
-                          \x20++
-
-                          (?'subject'.++)
+                          # End of pattern+modifiers; start of subject.
+                          (
+                              \x{20}++
+                              (?'subject'.++)
+                          )?+
 
                           (?(DEFINE)
-                              (?<Modifiers>
-                                  (?&Modifier_short) (?>,(?&Modifier_short))*+
-                                  (?>,(?&Modifier_long))*+
-                              |
-                                  (?&Modifier_long)
-                                  (?>,(?&Modifier_long))*+
+                              (?'get_modifiers'
+                                  (?&modifier_short) (?> ,(?&modifier_short))*+
+                                  (?> ,(?&modifier_long))*+
+                                  |
+                                  (?&modifier_long)
+                                  (?> ,(?&modifier_long))*+
                               )?+
-                              (?<Modifier_long> \h*+\b
-                                  (?>allow_empty_class|allow_lookaround_bsk|allow_surrogate_escapes|alt_bsux|alt_circumflex|alt_extended_class|alt_verbnames|anchored|ascii_all|ascii_bsd|ascii_bss|ascii_bsw|ascii_digit|ascii_posix|auto_callout
-                                  |bad_escape_is_literal
-                                  |caseless|caseless_restrict
-                                  |dollar_endonly|dotall|dupnames
-                                  |endanchored|escaped_cr_is_lf|extended|extended_more|extra_alt_bsux
-                                  |firstline
-                                  |literal
-                                  |match_line|match_invalid_utf|match_unset_backref|match_word|multiline
-                                  |never_backslash_c|never_callout|never_ucp|never_utf|no_auto_capture|no_auto_possess|no_bs0|no_dotstar_anchor|no_start_optimize|no_utf_check
-                                  |python_octal
-                                  |replace
-                                  |turkish_casing
-                                  |ucp|ungreedy|use_offset_limit|utf
+                              (?'modifier_long'
+                                  \b(?>
+                                      allow_empty_class | allow_lookaround_bsk | allow_surrogate_escapes | alt_bsux | alt_circumflex | alt_extended_class | alt_verbnames
+                                      | anchored | ascii_all | ascii_bsd | ascii_bss | ascii_bsw | ascii_digit | ascii_posix | auto_callout | auto_possess_off | auto_possess
+                                      | bad_escape_is_literal | bincode | bsr
+                                      | callout_info | caseless_restrict | caseless | convert_glob_escape | convert_glob_separator | convert_length | convert
+                                      | debug | dollar_endonly | dotall | dotstar_anchor_off | dotstar_anchor | dupnames
+                                      | endanchored | escaped_cr_is_lf | expand | extended_more | extended | extra_alt_bsux
+                                      | firstline | framesize | fullbincode
+                                      | hex
+                                      | info
+                                      | jitverify | jitfast | jit
+                                      | literal | locale
+                                      | match_line | match_invalid_utf | match_unset_backref | match_word | max_pattern_compiled_length | max_pattern_length | max_varlookbehind
+                                      | memory | multiline
+                                      | never_backslash_c | never_callout | never_ucp | never_utf | newline | no_auto_capture | no_auto_possess | no_bs0 | no_dotstar_anchor
+                                      | no_start_optimize | no_utf_check | null_context | null_pattern
+                                      | optimization_full | optimization_none
+                                      | parens_nest_limit | posix_nosub | posix | pushcopy | pushtablescopy | push | python_octal
+                                      | regerror_buffsize | replace
+                                      | stackguard | start_optimize_off | start_optimize | subject_literal
+                                      | tables | turkish_casing
+                                      | ucp | ungreedy | use_length | use_offset_limit | utf8_input | utf
                                   )\b
 
                                   # Only some modifiers allow '=value', so if you WANT to be
                                   # spec-compliant, you could break those out separately.
                                   (?> =
-                                      # Allows '\ ' in 'replace=foo\ bar\ baz' to be included
+                                      # Allows '\ ' in 'replace=foo\ bar\ baz' to be included.
                                       (?> [^,\s\\]++ | \\[^\n,] )++
                                   )?+
                               )
-                              (?<Modifier_short>\h*+\b (?>[agimnrs]++|x{1,2}+)++ \b)
+                              (?'modifier_short' \b(?> [agimnrs]++ | x{1,2}+)++\b)
                           )
-                      /x) {
-            $delimiter = $+{delimiter};
-            $pattern   = $+{pattern};
-            $modifiers = $+{modifiers};
-            $subject   = $+{subject};
-            $regexp    = "${delimiter}${pattern}${delimiter}$modifiers";
+                          \z
+                      }x) {
+            $delimiter = $+{delimiter} // '';
+            $pattern   = $+{pattern}   // '';
+            $modifiers = $+{modifiers} // '';
+            $subject   = $+{subject}   // '';
 
-            print "\$pattern: '${regexp}'\n";
-            print "\$subject '${subject}'\n";
+            print "\$regexp:    '${regexp}'\n";
+            print "\$subject:   '${subject}'\n";
+            print "\$modifiers: '${modifiers}'\n";
+
+            # Replace all escaped spaces '\ ' with a space, from 'replace' modifier.
+            if ($modifiers =~ /\breplace=\K(?> \\. | (?!\\)[^\x{20}])++/x) {
+                my $match = $&;
+                my $start = $-[0];
+                my $end   = $+[0];
+
+                print "\$match: '${match}'\n";
+
+                my $replace = $match =~ s/\\(\x{20})/$1/gr;
+
+                print "\$start,end: '${start},${end}'\n";
+                print "\$match:     '${match}'\n";
+
+                substr $modifiers, $start, $end, $replace;
+            }
+            print "\$modifiers: '${modifiers}'\n";
+
+            $regexp = "${delimiter}${pattern}${delimiter}$modifiers";
         }
 
         if (! defined $regexp) {
@@ -623,26 +672,6 @@ sub irc_msg
     return;
 }
 
-# We registered for all events, this will produce some debug info.
-#sub _default
-#{
-#    my ($event, $args) = @_[ARG0 .. $#_];
-#    my @output = ("$event: ");
-#
-#    foreach my $arg (@$args) {
-#        if (ref $arg eq 'ARRAY') {
-#            push(@output, '[' . join(', ', @$arg ) . ']');
-#        }
-#        else {
-#            push (@output, "'${arg}'");
-#        }
-#    }
-#
-#    print join ' ', @output, "\n";
-#
-#    return;
-#}
-
 # Upload pcre2test's output to a pastebin service.
 sub get_pastebin
 {
@@ -698,3 +727,26 @@ sub _response
 
     return;
 }
+
+# We registered for all events, this will produce some debug info.
+#sub _default
+#{
+#    my ($event, $args) = @_[ARG0 .. $#_];
+#    my @output = ("$event: ");
+#
+#    foreach my $arg (@$args) {
+#        if (ref $arg eq 'ARRAY') {
+#            push(@output, '[' . join(', ', @$arg ) . ']');
+#        }
+#        else {
+#            push (@output, "'${arg}'");
+#        }
+#    }
+#
+#    print join ' ', @output, "\n";
+#
+#    return;
+#}
+
+check_pcre2test();
+$poe_kernel->run();
