@@ -60,6 +60,7 @@
 #     passwords.
 #   - When bot is finished and stable, ask for permission on libera.#regex to have
 #     it +v.
+#   - Add an AUR pcre2bot package.
 
 use strict;
 use warnings;
@@ -77,15 +78,18 @@ use Data::Dumper          qw< Dumper >;
 
 END { close STDOUT or die $! }
 
-my $prog     = basename $0;
-my $prog_ver = '0.1';
+# Global variables
 
 $|++;  # Disable STDOUT buffering.
+
+my $prog     = basename $0;
+my $prog_ver = '0.1';
 
 # Configuration
 
 my $nickname   = 'pcre2bot';
-my $ircname    = 'ryoskzypu';
+my $username   = 'ryoskzypu';
+my $ircname    = 'pcre2test IRC bot';
 my $umode      = '+IG';
 my $server     = 'irc.libera.chat';
 my $port       = '6697';
@@ -133,23 +137,67 @@ my @urls = (
 );
 
 # Regexes
-my $pcre2_ver = qr/\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
+my $pcre2_ver_rgx = qr/\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
+my $delimiter_rgx = qr{[/!"'`=_:;,%&@~-]}x;
+my $modifiers_rgx = qr/
+                        (?(DEFINE)
+                            (?'get_modifiers'
+                                (?&modifier_short) (?> ,(?&modifier_short))*+
+                                (?> ,(?&modifier_long))*+
+                                |
+                                (?&modifier_long)
+                                (?> ,(?&modifier_long))*+
+                            )?+
 
-# Check if pcre2test is installed on user's system.
-sub check_pcre2test
-{
-    # Exit with an error if pcre2test is not found on $PATH.
-    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
+                            # See 'pcre2test -LM' for the complete list.
+                            (?'modifier_long'
+                                \b(?>
+                                    allow_empty_class | allow_lookaround_bsk | allow_surrogate_escapes | alt_bsux | alt_circumflex | alt_extended_class | alt_verbnames
+                                    | anchored | ascii_all | ascii_bsd | ascii_bss | ascii_bsw | ascii_digit | ascii_posix | auto_callout | auto_possess_off | auto_possess
+                                    | aftertext | allaftertext | allcaptures | allusedtext | allvector | altglobal
+                                    | bad_escape_is_literal | bincode | bsr
+                                    | callout_info | caseless_restrict | caseless | convert_glob_escape | convert_glob_separator | convert_length | convert
+                                    | debug | dollar_endonly | dotall | dotstar_anchor_off | dotstar_anchor | dupnames
+                                    | endanchored | escaped_cr_is_lf | expand | extended_more | extended | extra_alt_bsux
+                                    | firstline | framesize | fullbincode
+                                    | global
+                                    | hex | heapframes_size
+                                    | info
+                                    | jitverify | jitstack | jitfast | jit
+                                    | literal | locale
+                                    | match_line | match_invalid_utf | match_unset_backref | match_word | max_pattern_compiled_length | max_pattern_length | max_varlookbehind | mark
+                                    | memory | multiline
+                                    | never_backslash_c | never_callout | never_ucp | never_utf | newline | no_auto_capture | no_auto_possess | no_bs0 | no_dotstar_anchor
+                                    | no_start_optimize | no_utf_check | null_context | null_pattern
+                                    | optimization_full | optimization_none
+                                    | parens_nest_limit | posix_nosub | posix | pushcopy | pushtablescopy | push | python_octal
+                                    | regerror_buffsize | replace
+                                    | stackguard | start_optimize_off | start_optimize | subject_literal | startchar | substitute_callout | substitute_case_callout | substitute_extended
+                                    | substitute_literal | substitute_matched | substitute_overflow_length | substitute_replacement_only | substitute_skip | substitute_stop
+                                    | substitute_unknown_unset | substitute_unset_empty
+                                    | tables | turkish_casing
+                                    | ucp | ungreedy | use_length | use_offset_limit | utf8_input | utf
+                                )\b
 
-    if (($? >> 8) > 0) {
-        print STDERR "${prog}: pcre2test is not installed\n";
-        exit 1;
-    }
-}
+                                # Only some modifiers allow '=value', so if you WANT to be
+                                # spec-compliant, you could break those out separately.
+                                (?> =
+                                    # Allows '\ ' in 'replace=foo\ bar\ baz' to be included.
+                                    # Also '\,' in 'replace=foo\,bar\,baz'.
+                                    (?> [^,\s\\]++ | \\[^\n,] | \\,)++
+                                )?+
+                            )
+                            (?'modifier_short' \b(?> [agimnrs]++ | x{1,2}+)++\b)
+                        )
+                    /x;
+
+# Unique conversion flag ('replace' modifier)
+my $conv_uniq = 0;
 
 # Create a PoCo-IRC object.
 my $irc = POE::Component::IRC->spawn(
    nick         => $nickname,
+   username     => $username,
    ircname      => $ircname,
    server       => $server,
    port         => $port,
@@ -187,11 +235,25 @@ my $curl = POE::Component::Curl::Multi->spawn(
     max_concurrency => 10,
 );
 
+# Subroutines
+
+# Check if pcre2test is installed on user's system.
+sub check_pcre2test
+{
+    # Exit with an error if pcre2test is not found on $PATH.
+    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
+
+    if (($? >> 8) > 0) {
+        print STDERR "${prog}: pcre2test is not installed\n";
+        exit 1;
+    }
+}
+
 # Start handler
 sub _start
 {
     my $heap = $_[HEAP];
-    my $irc = $heap->{irc};
+    my $irc  = $heap->{irc};
 
     # Keep bot connected to the IRC server on disconnects.
     $heap->{connector} = POE::Component::IRC::Plugin::Connector->new();
@@ -238,8 +300,8 @@ sub run_pcre2test
     $heap->{children_by_pid}{$child->PID} = $child;
 
     print(
-        "Child pid ", $child->PID,
-        " started as wheel ", $child->ID, ".\n"
+        'Child pid ', $child->PID,
+        ' started as wheel ', $child->ID, ".\n"
     );
 }
 
@@ -255,11 +317,11 @@ sub got_child_stdout
     my $nick     = $heap->{nick};
     my $line_cnt = scalar @lines;
 
-    print "pid ", $child->PID, " STDOUT: $stdout_line\n";
+    print 'pid ', $child->PID, " STDOUT: ${stdout_line}\n";
 
     # Last output line.
     if ($stdout_line eq '') {
-        print "\$line_cnt $line_cnt\n";
+        print "\$line_cnt ${line_cnt}\n";
 
         # Send output to a pastebin service, if line count exceeds the limit.
         if ($line_cnt > $max_lines + 1) {
@@ -271,15 +333,20 @@ sub got_child_stdout
 
         # Reset
         @lines = ();
+        $conv_uniq = 0;
     }
     else {
-        print "\$line_cnt $line_cnt\n";
+        print "\$line_cnt ${line_cnt}\n";
+
+        # Convert back the escaped unique char to a comma. Note that pcre2test
+        # also displays the unique '\034' char as a literal '\x{1c}' in hex notation.
+        $stdout_line =~ s/\o{034} | \\x\{1c\}/,/gx if $conv_uniq;
 
         # Count all lines except the version line from command.
-        push @lines, $stdout_line if $stdout_line !~ $pcre2_ver;
+        push @lines, $stdout_line if $stdout_line !~ $pcre2_ver_rgx;
 
-        if ($stdout_line !~ $pcre2_ver) {
-            if ($heap->{trigger} =~ /\A(?>default|callouts)\z/ && $line_cnt < $max_lines + 1) {
+        if ($stdout_line !~ $pcre2_ver_rgx) {
+            if ($heap->{trigger} =~ /\A(?> default | callouts)\z/x && $line_cnt < $max_lines + 1) {
                 # Ignore the first 2 lines if the trigger is a default or callout,
                 # because pattern/subject is already known to the user.
                 return if $line_cnt =~ /\A[01]\z/;
@@ -287,7 +354,7 @@ sub got_child_stdout
                 # Send output to the channel.
                 $irc->yield(privmsg => $channel, "${nick}$stdout_line");
             }
-            elsif ($heap->{trigger} =~ /\A(?>verbose)\z/ && $line_cnt < $max_lines - 1) {
+            elsif ($heap->{trigger} =~ /\Averbose\z/ && $line_cnt < $max_lines - 1) {
                 $irc->yield(privmsg => $channel, "${nick}$stdout_line");
             }
         } else {
@@ -302,7 +369,7 @@ sub got_child_stderr
     my ($stderr_line, $wheel_id) = @_[ARG0, ARG1];
     my $child = $_[HEAP]{children_by_wid}{$wheel_id};
 
-    print "pid ", $child->PID, " STDERR: $stderr_line\n";
+    print 'pid ', $child->PID, " STDERR: ${stderr_line}\n";
 }
 
 # Handle pcre2test's close events.
@@ -317,7 +384,7 @@ sub got_child_close
         return;
     }
 
-    print "pid ", $child->PID, " closed all pipes.\n";
+    print 'pid ', $child->PID, " closed all pipes.\n";
     delete $_[HEAP]{children_by_pid}{$child->PID};
 }
 
@@ -351,7 +418,7 @@ sub got_child_signal
 sub irc_identified
 {
     my $sender = $_[SENDER];
-    my $irc = $sender->get_heap();
+    my $irc    = $sender->get_heap();
 
     print "Nick is identified, joining channels.\n";
 
@@ -380,28 +447,42 @@ sub irc_identified
 #
 # Examples:
 #   re> /(?<=ab)c/ abc
+#   re> s/abc/<$0>/g abc
 #   pcre2bot: version
 #
 # Notes:
-#   - The trigger's pattern and subject must be separated by a space, since newlines
-#     on IRC terminates the message and IRC does not support multiline messages
-#     in the original spec.
-#     Thus the drawback is that 'replace=...' modifier cannot have spaces, so
-#     the s/// syntax must be used.
-#   - To avoid spam, only one subject test is allowed per pattern/trigger invocation,
+#   - The trigger's pattern and subject must be separated by spaces '\x20', since
+#     newlines on IRC terminates a message and IRC does not support multiline
+#     messages in the original spec.
+#
+#     Thus the drawback is that modifiers cannot have spaces, specially the 'replace=...'
+#     modifier, so a space must be escaped to be included, e.g. 'replace=some\ text'.
+#     Commas are also not allowed and must be escaped aswell, because they are
+#     modifiers separators.
+#     The s/// syntax can be used to avoid these issues.
+#     There are some problems to show a literal backslash before a space or comma,
+#     but at this point just use s///.
+#
+#   - To prevent spam, only one subject test is allowed per trigger invocation,
 #     and pcre2test outputs that exceed the $max_lines variable are uploaded to
 #     a pastebin service.
+#     Ethically, the pastebin service should be hosted by the user.
+#
 #   - IRC messages must have a limit of 512 bytes according to the spec, thus the
 #     tests are also limited.
+#
 #   - Newlines in the pattern are valid in pcre2test, but IRC is line oriented
 #     and chats must not be spammed.
 #     Also pcre2test interprets trailing newlines as subjects separators, so a
-#     '\n' escape sequence must be used for multi-line matches.
+#     '\n' escape sequence must be used for multiline matches.
+#
 #   - See pcre2test(1) for more details.
 #
 # TODO:
 #   - Make tests to assert if pcre2test can be abused or crash user's machine.
 #     Perhaps limit some resources and modifiers to prevent abuse.
+#   - Add a limitation on the pastebin service, to prevent abuse and blocking of
+#     user's IP.
 sub parse_privmsg
 {
     my ($kernel, $heap, $nick, $channel, $message) = @_;
@@ -413,7 +494,7 @@ sub parse_privmsg
     # Commands
     if ($message =~ /
                         \A
-                        \Q$nickname\E[:,]?
+                        \Q$nickname\E[:,]?+
                         \ (?>
                             (?'cmd1' help) | (?'cmd2' version)
                           )
@@ -443,6 +524,7 @@ sub parse_privmsg
         my $input;
         my $delimiter;
         my $pattern;
+        my $replacement;
         my $modifiers;
         my $subject;
         my $regexp;
@@ -457,6 +539,7 @@ sub parse_privmsg
             $pat_mod  .= ',auto_callout,info';
             $subj_mod .= ',callout_extra';
             #$subj_mod .= ',callout_extra,callout_capture';
+
             $heap->{trigger} = 'verbose';
         }
         # Callouts
@@ -489,29 +572,20 @@ sub parse_privmsg
         # since pattern and subjects must be separated by a space.
         #
         # TODO:
-        #   - Disallow leading spaces on modifiers, so subject strings can be
-        #     parsed without clashing with modifiers that has spaces (e.g. /utf/ utf;
-        #     /a/ a). *OK*
-        #   - Restrict modifiers in an allow list that is configurable by the user.
-        #     Also backslashes can be used to allow spaces in 'replace=...', e.g.
-        #     'replace=some\ \ text Subject string'. Document it aswell.
-        #     Replace '\ ' with a space before sending it to pcre2test. *OK*
-        #   - Add a s/// trigger that uses pcre2 substitute function. Do not forget
-        #     to ignore 'replace=...' modifiers on it.
-        #   - '/replace= ...' also does not allow commas, so if a user use commas,
-        #     replace them with a unique char to pcre2test.
-        #     It has to be in s/// syntax, because of the same reasons pcre2test
-        #     does not allow commas.
+        #   - Restrict modifiers in an allow list that is configurable by the user,
+        #     because some modifiers can potentially cause problems.
+        #     Perhaps the single letter modifiers are enough, so check if there
+        #     is a long modifier that could be useful.
         #   - Decide if '\=...' subjects modifiers should be allowed. It can be
         #     disabled with the subject_literal modifier, however backslash interpretation
         #     will be disabled aswell.
-        #   - Add a s/// syntax for the 'rev' trigger, so it will use substitute_callout
-        #     modifier by default.
+
+        # /pattern/modifiers subject
         if ($input =~ m{
+                          # This is for the /pattern/modifiers format only.
                           \A
                           \h*+
-                          # This is for the /match/modifiers format only.
-                          (?'delimiter' [/!"'`=_:;,%&@~-])   # Opening delimiter
+                          (?'delimiter' $delimiter_rgx)      # Opening delimiter
                           (?'pattern'
                               (?> \\.
                                   | (?!\k{delimiter}) [^\\]
@@ -519,56 +593,14 @@ sub parse_privmsg
                           )
                           \k{delimiter}                      # Closing delimiter
 
+                          $modifiers_rgx
                           (?'modifiers' (?&get_modifiers))?+
 
-                          # End of pattern+modifiers; start of subject.
+                          # End of /pattern/modifiers; start of subject.
                           (
                               \x{20}++
                               (?'subject'.++)
                           )?+
-
-                          (?(DEFINE)
-                              (?'get_modifiers'
-                                  (?&modifier_short) (?> ,(?&modifier_short))*+
-                                  (?> ,(?&modifier_long))*+
-                                  |
-                                  (?&modifier_long)
-                                  (?> ,(?&modifier_long))*+
-                              )?+
-                              (?'modifier_long'
-                                  \b(?>
-                                      allow_empty_class | allow_lookaround_bsk | allow_surrogate_escapes | alt_bsux | alt_circumflex | alt_extended_class | alt_verbnames
-                                      | anchored | ascii_all | ascii_bsd | ascii_bss | ascii_bsw | ascii_digit | ascii_posix | auto_callout | auto_possess_off | auto_possess
-                                      | bad_escape_is_literal | bincode | bsr
-                                      | callout_info | caseless_restrict | caseless | convert_glob_escape | convert_glob_separator | convert_length | convert
-                                      | debug | dollar_endonly | dotall | dotstar_anchor_off | dotstar_anchor | dupnames
-                                      | endanchored | escaped_cr_is_lf | expand | extended_more | extended | extra_alt_bsux
-                                      | firstline | framesize | fullbincode
-                                      | hex
-                                      | info
-                                      | jitverify | jitfast | jit
-                                      | literal | locale
-                                      | match_line | match_invalid_utf | match_unset_backref | match_word | max_pattern_compiled_length | max_pattern_length | max_varlookbehind
-                                      | memory | multiline
-                                      | never_backslash_c | never_callout | never_ucp | never_utf | newline | no_auto_capture | no_auto_possess | no_bs0 | no_dotstar_anchor
-                                      | no_start_optimize | no_utf_check | null_context | null_pattern
-                                      | optimization_full | optimization_none
-                                      | parens_nest_limit | posix_nosub | posix | pushcopy | pushtablescopy | push | python_octal
-                                      | regerror_buffsize | replace
-                                      | stackguard | start_optimize_off | start_optimize | subject_literal
-                                      | tables | turkish_casing
-                                      | ucp | ungreedy | use_length | use_offset_limit | utf8_input | utf
-                                  )\b
-
-                                  # Only some modifiers allow '=value', so if you WANT to be
-                                  # spec-compliant, you could break those out separately.
-                                  (?> =
-                                      # Allows '\ ' in 'replace=foo\ bar\ baz' to be included.
-                                      (?> [^,\s\\]++ | \\[^\n,] )++
-                                  )?+
-                              )
-                              (?'modifier_short' \b(?> [agimnrs]++ | x{1,2}+)++\b)
-                          )
                           \z
                       }x) {
             $delimiter = $+{delimiter} // '';
@@ -576,28 +608,99 @@ sub parse_privmsg
             $modifiers = $+{modifiers} // '';
             $subject   = $+{subject}   // '';
 
-            print "\$regexp:    '${regexp}'\n";
-            print "\$subject:   '${subject}'\n";
-            print "\$modifiers: '${modifiers}'\n";
+            print <<~_;
+                \$delimiter: '${delimiter}'
+                \$pattern:   '${pattern}'
+                \$modifiers: '${modifiers}'
+                \$subject:   '${subject}'
+                _
 
-            # Replace all escaped spaces '\ ' with a space, from 'replace' modifier.
-            if ($modifiers =~ /\breplace=\K(?> \\. | (?!\\)[^\x{20}])++/x) {
+            # Parse the 'replace' modifier value.
+            if ($modifiers =~ /\breplace=\K(?> \\[^\n] | (?!\\)[^\x{20},])++/x) {
                 my $match = $&;
                 my $start = $-[0];
                 my $end   = $+[0];
 
-                print "\$match: '${match}'\n";
+                print "\$match:       '${match}'\n";
+                print "\$start,\$end: '${start},${end}'\n";
 
+                # Replace all escaped commas with a unique escape char '\034'.
+                if ($match =~ s/\\,/\o{034}/g) {
+                    print "\$match:       '${match}'\n";
+                    $conv_uniq = 1;
+                }
+
+                # Replace all escaped spaces '\ ' with a space.
                 my $replace = $match =~ s/\\(\x{20})/$1/gr;
-
-                print "\$start,end: '${start},${end}'\n";
-                print "\$match:     '${match}'\n";
+                print "\$replace:     '${replace}'\n";
 
                 substr $modifiers, $start, $end, $replace;
             }
             print "\$modifiers: '${modifiers}'\n";
 
             $regexp = "${delimiter}${pattern}${delimiter}$modifiers";
+            print "\$regexp:    '${regexp}'\n";
+        }
+        # s/pattern/replacement/modifiers subject
+        elsif ($input =~ m{
+                          # This is for the s/pattern/replacement/modifiers format only.
+                          \A
+                          \h*+
+                          s
+                          (?'delimiter' $delimiter_rgx)      # Opening delimiter
+                          (?'pattern'
+                              (?> \\.
+                                  | (?!\k{delimiter}) [^\\]
+                              )*+
+                          )
+                          \k{delimiter}
+                          (?'replacement'
+                              (?> \\.
+                                  | (?!\k{delimiter}) [^\\]
+                              )*+
+                          )
+                          \k{delimiter}                      # Closing delimiter
+
+                          $modifiers_rgx
+                          (?'modifiers' (?&get_modifiers))?+
+
+                          # End of s/pattern/replacement/modifiers; start of subject.
+                          (
+                              \x{20}++
+                              (?'subject'.++)
+                          )?+
+                          \z
+                      }x) {
+            $delimiter   = $+{delimiter}   // '';
+            $pattern     = $+{pattern}     // '';
+            $replacement = $+{replacement} // '';
+            $modifiers   = $+{modifiers}   // '';
+            $subject     = $+{subject}     // '';
+
+            print <<~_;
+                \$delimiter:   '${delimiter}'
+                \$pattern:     '${pattern}'
+                \$replacement: '${replacement}'
+                \$modifiers:   '${modifiers}'
+                \$subject:     '${subject}'
+                _
+
+            # Parse the 'replacement' string.
+            if ($replacement =~ /,/) {
+                # Replace all commas with a unique escape char '\034'.
+                if ($replacement =~ s/,/\o{034}/g) {
+                    print "\$replacement: '${replacement}'\n";
+                    $conv_uniq = 1;
+                }
+            }
+
+            $regexp = "${delimiter}${pattern}${delimiter}${modifiers},replace=${replacement}";
+
+            if ($heap->{trigger} =~ /\A(?> callouts | verbose)\z/x) {
+                $regexp .= ',substitute_callout';
+            }
+
+            print "\$regexp:      '${regexp}'\n";
         }
 
         if (! defined $regexp) {
@@ -640,11 +743,11 @@ sub irc_public
 {
     # :ryoskzypu!~user@user/ryoskzypu PRIVMSG ##testing-weechat :pcre2bot: x
     my ($sender, $who, $command, $message) = @_[SENDER, ARG0 .. ARG2];
-    my $nick     = (split /!/, $who)[0];
-    my $channel  = $command->[0];
+    my $nick    = (split /!/, $who)[0];
+    my $channel = $command->[0];
     #my $irc     = $_[SENDER]->get_heap();
-    my $heap     = $_[HEAP];
-    my $kernel   = $_[KERNEL];
+    my $heap    = $_[HEAP];
+    my $kernel  = $_[KERNEL];
 
     $heap->{input_chann} = $channel;
     $heap->{nick}        = "${nick}: ";
@@ -659,10 +762,10 @@ sub irc_msg
 {
     # :ryoskzypu!~user@user/ryoskzypu PRIVMSG pcre2bot :pcre2bot: x
     my ($sender, $who, undef, $message) = @_[SENDER, ARG0 .. ARG2];
-    my $nick = (split /!/, $who)[0];
-    #my $irc     = $_[SENDER]->get_heap();
-    my $heap     = $_[HEAP];
-    my $kernel   = $_[KERNEL];
+    my $nick   = (split /!/, $who)[0];
+    #my $irc    = $_[SENDER]->get_heap();
+    my $heap   = $_[HEAP];
+    my $kernel = $_[KERNEL];
 
     $heap->{input_chann} = $nick;
     $heap->{nick}        = '';
@@ -732,11 +835,11 @@ sub _response
 #sub _default
 #{
 #    my ($event, $args) = @_[ARG0 .. $#_];
-#    my @output = ("$event: ");
+#    my @output = ("${event}: ");
 #
-#    foreach my $arg (@$args) {
+#    foreach my $arg ($args->@*) {
 #        if (ref $arg eq 'ARRAY') {
-#            push(@output, '[' . join(', ', @$arg ) . ']');
+#            push(@output, '[' . join(', ', $arg->@* ) . ']');
 #        }
 #        else {
 #            push (@output, "'${arg}'");
