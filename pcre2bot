@@ -107,13 +107,24 @@ my @channels = (
 # the stable release.
 my $password = '';
 
+# List of the only nicks that can use pcre2bot.
 my @allow_list = (
     qw<
     >
 );
 
+# List of nicks that cannot use pcre2bot.
 my @ignore_list = (
     qw<
+    >
+);
+
+# List of the only modifiers that are allowed in pcre2test.
+# Note that single letter modifiers must not be concatenated.
+my @modifiers_list = (
+    qw<
+      g
+      newline
     >
 );
 
@@ -139,55 +150,84 @@ my @urls = (
 # Regexes
 my $pcre2_ver_rgx = qr/\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
 my $delimiter_rgx = qr{[/!"'`=_:;,%&@~-]}x;
+my $mod_short_rgx = qr/\b(?> [agimnrsBI]++ | x{1,2}+)++\b/x;
+# TODO:
+#   - Double check the long modifiers list, because probably there's some wrong
+#     or missing.
 my $modifiers_rgx = qr/
                         (?(DEFINE)
+                            # Single letter modifiers must be concatenated and come before longs.
                             (?'get_modifiers'
-                                (?&modifier_short) (?> ,(?&modifier_short))*+
+                                (?&modifier_short)
                                 (?> ,(?&modifier_long))*+
                                 |
                                 (?&modifier_long)
                                 (?> ,(?&modifier_long))*+
                             )?+
 
-                            # See 'pcre2test -LM' for the complete list.
-                            (?'modifier_long'
-                                \b(?>
-                                    allow_empty_class | allow_lookaround_bsk | allow_surrogate_escapes | alt_bsux | alt_circumflex | alt_extended_class | alt_verbnames
-                                    | anchored | ascii_all | ascii_bsd | ascii_bss | ascii_bsw | ascii_digit | ascii_posix | auto_callout | auto_possess_off | auto_possess
-                                    | aftertext | allaftertext | allcaptures | allusedtext | allvector | altglobal
-                                    | bad_escape_is_literal | bincode | bsr
-                                    | callout_info | caseless_restrict | caseless | convert_glob_escape | convert_glob_separator | convert_length | convert
-                                    | debug | dollar_endonly | dotall | dotstar_anchor_off | dotstar_anchor | dupnames
-                                    | endanchored | escaped_cr_is_lf | expand | extended_more | extended | extra_alt_bsux
-                                    | firstline | framesize | fullbincode
-                                    | global
-                                    | hex | heapframes_size
-                                    | info
-                                    | jitverify | jitstack | jitfast | jit
-                                    | literal | locale
-                                    | match_line | match_invalid_utf | match_unset_backref | match_word | max_pattern_compiled_length | max_pattern_length | max_varlookbehind | mark
-                                    | memory | multiline
-                                    | never_backslash_c | never_callout | never_ucp | never_utf | newline | no_auto_capture | no_auto_possess | no_bs0 | no_dotstar_anchor
-                                    | no_start_optimize | no_utf_check | null_context | null_pattern
-                                    | optimization_full | optimization_none
-                                    | parens_nest_limit | posix_nosub | posix | pushcopy | pushtablescopy | push | python_octal
-                                    | regerror_buffsize | replace
-                                    | stackguard | start_optimize_off | start_optimize | subject_literal | startchar | substitute_callout | substitute_case_callout | substitute_extended
-                                    | substitute_literal | substitute_matched | substitute_overflow_length | substitute_replacement_only | substitute_skip | substitute_stop
-                                    | substitute_unknown_unset | substitute_unset_empty
-                                    | tables | turkish_casing
-                                    | ucp | ungreedy | use_length | use_offset_limit | utf8_input | utf
-                                )\b
+                            # See 'pcre2test -LM' and pcre2test(1) for the complete list.
 
-                                # Only some modifiers allow '=value', so if you WANT to be
-                                # spec-compliant, you could break those out separately.
-                                (?> =
-                                    # Allows '\ ' in 'replace=foo\ bar\ baz' to be included.
-                                    # Also '\,' in 'replace=foo\,bar\,baz'.
-                                    (?> [^,\s\\]++ | \\[^\n,] | \\,)++
-                                )?+
+                            (?'modifier_short' $mod_short_rgx)
+
+                            (?'modifier_long'
+                                (?>
+                                    -?
+                                    \b
+                                    (?>
+                                        allow_empty_class | allow_lookaround_bsk | allow_surrogate_escapes | alt_bsux | alt_circumflex | alt_extended_class | alt_verbnames
+                                        | anchored | ascii_all | ascii_bsd | ascii_bss | ascii_bsw | ascii_digit | ascii_posix | auto_callout | auto_possess_off | auto_possess
+                                        | aftertext | allaftertext | allcaptures | allusedtext | allvector | altglobal
+                                        | bad_escape_is_literal | bincode
+                                        | callout_info | caseless_restrict | caseless | convert_length
+                                        | debug | dollar_endonly | dotall | dotstar_anchor_off | dotstar_anchor | dupnames
+                                        | endanchored | escaped_cr_is_lf | expand | extended_more | extended | extra_alt_bsux
+                                        | firstline | framesize | fullbincode
+                                        | global
+                                        | hex | heapframes_size
+                                        | info
+                                        | jitverify | jitfast
+                                        | literal
+                                        | match_line | match_invalid_utf | match_unset_backref | match_word | mark
+                                        | memory | multiline
+                                        | never_backslash_c | never_callout | never_ucp | never_utf | no_auto_capture | no_auto_possess | no_bs0 | no_dotstar_anchor
+                                        | no_start_optimize | no_utf_check | null_context | null_pattern
+                                        | optimization_full | optimization_none
+                                        | posix_nosub | posix | pushcopy | pushtablescopy | push | python_octal
+                                        | start_optimize_off | start_optimize | subject_literal | startchar | substitute_callout | substitute_case_callout | substitute_extended
+                                        | substitute_literal | substitute_matched | substitute_overflow_length | substitute_replacement_only
+                                        | substitute_unknown_unset | substitute_unset_empty
+                                        | turkish_casing
+                                        | ucp | ungreedy | use_length | use_offset_limit | utf8_input | utf
+                                    )
+                                    \b
+                                )
+                                |
+                                # Modifiers that must contain a value.
+                                (?>
+                                    \b
+                                    bsr
+                                    | callout_error | callout_fail | convert_glob_escape | convert_glob_separator | convert | copy
+                                    | get
+                                    | heap_limit
+                                    | jitstack | jit
+                                    | locale
+                                    | match_limit | max_pattern_compiled_length | max_pattern_length | max_varlookbehind
+                                    | newline
+                                    | offset_limit | offset | ovector
+                                    | parens_nest_limit | posix_startend
+                                    | recursion_limit | regerror_buffsize | replace
+                                    | substitute_skip | substitute_stop | stackguard | startoffset
+                                    | tables
+                                    \b
+                                )
+                                =
+                                # Allows '\ ' in 'replace=foo\ bar\ baz' to be included.
+                                # Also '\,' in 'replace=foo\,bar\,baz'.
+                                (?> [^,\s\\]++ | \\[^\n,] | \\,)++
+                                |
+                                # Force a failure if nothing matches.
+                                (*COMMIT)(*FAIL)
                             )
-                            (?'modifier_short' \b(?> [agimnrs]++ | x{1,2}+)++\b)
                         )
                     /x;
 
@@ -345,7 +385,8 @@ sub got_child_stdout
         # Count all lines except the version line from command.
         push @lines, $stdout_line if $stdout_line !~ $pcre2_ver_rgx;
 
-        if ($stdout_line !~ $pcre2_ver_rgx) {
+        # Ignore pcre2test's error/version messages.
+        if ($stdout_line !~ /\A\*\* [^\n]++\z/ && $stdout_line !~ $pcre2_ver_rgx) {
             if ($heap->{trigger} =~ /\A(?> default | callouts)\z/x && $line_cnt < $max_lines + 1) {
                 # Ignore the first 2 lines if the trigger is a default or callout,
                 # because pattern/subject is already known to the user.
@@ -426,6 +467,67 @@ sub irc_identified
     $irc->yield(join => $_) foreach @channels;
 }
 
+# Check if a modifier from pattern modifiers is allowed to be used.
+sub check_modifiers
+{
+    my ($channel, $nick, $modifiers)  = @_;
+    my @split_mods = split /(?<!\\),/, $modifiers;
+
+    print "\$split_mods:\n", Dumper \@split_mods;
+
+    # Check short modifiers.
+    if ($split_mods[0] =~ $mod_short_rgx) {
+        print "'$split_mods[0]' is a short modifier\n";
+
+        foreach my $i (split //, $split_mods[0]) {
+            print "${i}\n";
+
+            if (! grep { $_ eq $i } @modifiers_list) {
+                print "short modifier '${i}' is not in allow list\n";
+                $irc->yield(privmsg => $channel => "${nick}short '${i}' modifier is not allowed");
+
+                return 0;
+            }
+        }
+        shift @split_mods;
+    }
+
+    # Check long modifiers.
+    foreach my $i (@split_mods) {
+        $i =~ s/=.++\z//g;
+
+        if (! grep { $_ eq $i } @modifiers_list) {
+            print "modifier '${i}' is not in allow list\n";
+            $irc->yield(privmsg => $channel => "${nick}long '${i}' modifier is not allowed");
+
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
+# Get the position where the last regexp global match ended for the variable.
+sub get_last_pos
+{
+    my ($var, $len) = @_;
+
+    my $last_pos = pos $var->$*;
+
+    if (defined $last_pos && defined $len) {
+        my $pos_line = unpack "x$last_pos a$len", $var->$*;
+
+        if (defined $pos_line) {
+            print <<~_;
+                \$last_pos:  $last_pos
+                \$pos_line: '${pos_line}'\n
+                _
+
+            return $pos_line;
+        }
+    }
+}
+
 # Parse PRIVMSG before sending it to pcre2test.
 #
 # Usage:
@@ -434,6 +536,8 @@ sub irc_identified
 #
 #   nick: command
 #
+# Modifiers are separated by a comma, also short modifiers are concatenated and
+# put before long modifiers.
 # Commands are put after the bot nick with an optional colon or comma suffix.
 #
 # Triggers:
@@ -462,6 +566,9 @@ sub irc_identified
 #     The s/// syntax can be used to avoid these issues.
 #     There are some problems to show a literal backslash before a space or comma,
 #     but at this point just use s///.
+#
+#   - pcre2test trim leading and trailing spaces, so spaces need to be encoded
+#     in hex notation to be included, e.g. '/ abc / \x20abc\x20'.
 #
 #   - To prevent spam, only one subject test is allowed per trigger invocation,
 #     and pcre2test outputs that exceed the $max_lines variable are uploaded to
@@ -522,11 +629,12 @@ sub parse_privmsg
                            \z
                        /x) {
         my $input;
-        my $delimiter;
-        my $pattern;
-        my $replacement;
-        my $modifiers;
-        my $subject;
+        my $replace     = 0;
+        my $delimiter   = '';
+        my $pattern     = '';
+        my $replacement = '';
+        my $modifiers   = '';
+        my $subject     = '';
         my $regexp;
 
         # Set options modifiers
@@ -580,41 +688,135 @@ sub parse_privmsg
         #     disabled with the subject_literal modifier, however backslash interpretation
         #     will be disabled aswell.
 
-        # /pattern/modifiers subject
+        # Start of /pattern/modifiers
         if ($input =~ m{
-                          # This is for the /pattern/modifiers format only.
                           \A
                           \h*+
-                          (?'delimiter' $delimiter_rgx)      # Opening delimiter
+                          (?'delimiter' $delimiter_rgx)  # Pattern opening delimiter
+                      }xgc) {
+            $delimiter = $+{delimiter};
+        }
+        # Start of s/pattern/replacement/modifiers
+        elsif ($input =~ m{
+                          \A
+                          \h*+
+                          s
+                          (?'delimiter' $delimiter_rgx)
+                      }xgc) {
+            $delimiter = $+{delimiter};
+            $replace   = 1;
+        }
+        else {
+            $irc->yield(privmsg => $channel => "${nick}invalid '${input}' pattern opening delimiter");
+            return;
+        }
+
+        print "\$delimiter: '${delimiter}'\n";
+
+        # Position where the last global match ended.
+        get_last_pos(\$input, 20);
+
+        # Pattern
+        if ($input =~ m{
+                          \G
                           (?'pattern'
                               (?> \\.
-                                  | (?!\k{delimiter}) [^\\]
+                                  | (?!$delimiter) [^\\]
                               )*+
                           )
-                          \k{delimiter}                      # Closing delimiter
+                      }xgc) {
+            $pattern = $+{pattern};
+        }
 
+        if ($pattern eq '') {
+            $irc->yield(privmsg => $channel => "${nick}missing pattern");
+            return;
+        } else {
+            print "\$pattern '${pattern}'\n";
+        }
+        get_last_pos(\$input, 20);
+
+        # Pattern closing delimiter
+        if ($input !~ m{\G$delimiter}gc) {
+            $irc->yield(privmsg => $channel => "${nick}missing or invalid pattern closing delimiter");
+            return;
+        }
+        get_last_pos(\$input, 20);
+
+        # Replacement string
+        if ($replace) {
+            if ($input =~ m{
+                              \G
+                              (?'replacement'
+                                  (?> \\.
+                                      | (?!$delimiter) [^\\]
+                                  )*+
+                              )
+                          }xgc) {
+                $replacement = $+{replacement};
+            }
+            if ($replacement eq '') {
+                $irc->yield(privmsg => $channel => "${nick}missing replacement string");
+                return;
+            } else {
+                print "\$replacement '${replacement}'\n";
+            }
+            get_last_pos(\$input, 20);
+
+            # Replacement closing delimiter
+            if ($input !~ m{\G$delimiter}gc) {
+                $irc->yield(privmsg => $channel => "${nick}missing or invalid replacement closing delimiter");
+                return;
+            }
+            get_last_pos(\$input, 20);
+        }
+
+        # Modifiers
+        if ($input =~ m{
+                          \G
                           $modifiers_rgx
                           (?'modifiers' (?&get_modifiers))?+
+                      }xgc) {
+            $modifiers = $+{modifiers};
+        }
+        # Get the string from the last match position, which are the modifiers.
+        my $pos_line = get_last_pos(\$input, 20);
 
-                          # End of /pattern/modifiers; start of subject.
+        # Error out only on invalid modifiers, so empty modifiers are accepted.
+        if ($modifiers eq '' && $pos_line ne '' && $pos_line !~ /^\x{20}/) {
+            $irc->yield(privmsg => $channel => "${nick}invalid '${pos_line}' modifiers");
+            return;
+        } else {
+            print "\$modifiers '${modifiers}'\n";
+        }
+
+        # End of /pattern/modifiers or /s/pattern/replacement/modifiers;
+        # Start of subject string
+        if ($input =~ m{
+                          \G
                           (
                               \x{20}++
                               (?'subject'.++)
                           )?+
                           \z
-                      }x) {
-            $delimiter = $+{delimiter} // '';
-            $pattern   = $+{pattern}   // '';
-            $modifiers = $+{modifiers} // '';
-            $subject   = $+{subject}   // '';
+                      }xgc) {
+            $subject = $+{subject};
+        }
 
-            print <<~_;
-                \$delimiter: '${delimiter}'
-                \$pattern:   '${pattern}'
-                \$modifiers: '${modifiers}'
-                \$subject:   '${subject}'
-                _
+        if ($subject eq '') {
+            $irc->yield(privmsg => $channel => "${nick}missing subject string");
+            return;
+        } else {
+            print "\$subject '${subject}'\n";
+        }
+        get_last_pos(\$input, 20);
 
+        # Check if a modifier is in the allow list.
+        if (@modifiers_list && $modifiers ne '') {
+            return unless check_modifiers($channel, $nick, $modifiers);
+        }
+
+        if (! $replace) {
             # Parse the 'replace' modifier value.
             if ($modifiers =~ /\breplace=\K(?> \\[^\n] | (?!\\)[^\x{20},])++/x) {
                 my $match = $&;
@@ -639,52 +841,9 @@ sub parse_privmsg
             print "\$modifiers: '${modifiers}'\n";
 
             $regexp = "${delimiter}${pattern}${delimiter}$modifiers";
-            print "\$regexp:    '${regexp}'\n";
+            print "\$regexp: '${regexp}'\n";
         }
-        # s/pattern/replacement/modifiers subject
-        elsif ($input =~ m{
-                          # This is for the s/pattern/replacement/modifiers format only.
-                          \A
-                          \h*+
-                          s
-                          (?'delimiter' $delimiter_rgx)      # Opening delimiter
-                          (?'pattern'
-                              (?> \\.
-                                  | (?!\k{delimiter}) [^\\]
-                              )*+
-                          )
-                          \k{delimiter}
-                          (?'replacement'
-                              (?> \\.
-                                  | (?!\k{delimiter}) [^\\]
-                              )*+
-                          )
-                          \k{delimiter}                      # Closing delimiter
-
-                          $modifiers_rgx
-                          (?'modifiers' (?&get_modifiers))?+
-
-                          # End of s/pattern/replacement/modifiers; start of subject.
-                          (
-                              \x{20}++
-                              (?'subject'.++)
-                          )?+
-                          \z
-                      }x) {
-            $delimiter   = $+{delimiter}   // '';
-            $pattern     = $+{pattern}     // '';
-            $replacement = $+{replacement} // '';
-            $modifiers   = $+{modifiers}   // '';
-            $subject     = $+{subject}     // '';
-
-            print <<~_;
-                \$delimiter:   '${delimiter}'
-                \$pattern:     '${pattern}'
-                \$replacement: '${replacement}'
-                \$modifiers:   '${modifiers}'
-                \$subject:     '${subject}'
-                _
-
+        else {
             # Parse the 'replacement' string.
             if ($replacement =~ /,/) {
                 # Replace all commas with a unique escape char '\034'.
@@ -700,17 +859,7 @@ sub parse_privmsg
                 $regexp .= ',substitute_callout';
             }
 
-            print "\$regexp:      '${regexp}'\n";
-        }
-
-        if (! defined $regexp) {
-            $irc->yield(privmsg => $channel => "${nick}invalid pattern");
-            return;
-        }
-
-        if (! defined $subject) {
-            $irc->yield(privmsg => $channel => "${nick}missing subject string");
-            return;
+            print "\$regexp: '${regexp}'\n";
         }
 
         # Construct a single test that is a valid pcre2test input.
