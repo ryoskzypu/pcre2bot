@@ -1,0 +1,89 @@
+# example_config.toml – pcre2bot's config file example
+#
+# References:
+#   https://github.com/toml-lang/toml
+#   https://metacpan.org/pod/TOML::Tiny
+#
+# Usage:
+#   All keys values that expect a string must be quoted, i.e. nickname = 'pcre2bot',
+#   except keys that expect a boolean integer value (1 = True; 0 = False), i.e.
+#   use_tls = 1.
+
+[server]
+
+nickname   = 'pcre2bot'
+username   = 'ryoskzypu'
+ircname    = 'pcre2test IRC bot'
+usermode   = '+IG'
+server     = 'irc.libera.chat'
+port       = '6697'
+use_tls    = 1
+debug      = 1
+debug_plug = 1
+
+# Hardcoding passwords in plaintext is bad. It's just temporary for testing before
+# the stable release.
+nickserv_password = ''
+
+# Auto-join channels
+channels = [
+    '#pcre2bot',
+    '#ryoskzypu',
+    '#regex',
+]
+
+# Name lists (~username@host)
+#
+# List of the only names that can use (allowed) or cannot use (ignored) pcre2bot.
+# Note that the 'allow' list has priority over 'ignore'.
+
+# Allowed
+names_allow = [
+]
+
+# Ignored
+names_ignore = [
+]
+
+[pcre2test]
+
+# Default options modifiers
+pattern_modifiers = 'no_start_optimize,no_auto_possess,no_dotstar_anchor,utf'
+subject_modifiers = 'ovector=0'
+
+# Modifiers allow lists
+#
+# Lists of the only pattern/subject modifiers that are allowed in pcre2test.
+# Note that single letter modifiers must not be concatenated, and a single empty
+# value restricts all modifiers.
+
+# Pattern
+pattern_mods_allow = [
+    'a',
+    'g',
+    'i',
+    'm',
+    'n',
+    'r',
+    's',
+    'x',
+]
+
+# Subject
+subject_mods_allow = [
+    '',
+]
+
+# Pastebin services
+#
+# Note that the services must accept HTTP POST requests with a file form field,
+# and return a URL of its paste.
+
+# pcre2test's maximum number of output lines before uploading them to a pastebin service.
+max_lines = 5
+
+primary_service = 'https://paste.c-net.org/'
+
+fallback_services = [
+    'https://0x0.st/',
+]
