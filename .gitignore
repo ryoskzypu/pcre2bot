@@ -1,0 +1,5 @@
+# Ignore tls directory that stores self-signed TLS certs/keys for the bot.
+/tls/
+
+# Ignore pcre2bot.toml config file that is being used.
+/pcre2bot.toml

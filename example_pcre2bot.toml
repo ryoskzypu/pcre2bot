@@ -1,4 +1,4 @@
-# example_config.toml – pcre2bot's config file example
+# example_pcre2bot.toml – pcre2bot's config file example
 #
 # References:
 #   https://github.com/toml-lang/toml
@@ -6,8 +6,17 @@
 #
 # Usage:
 #   All keys values that expect a string must be quoted, i.e. nickname = 'pcre2bot',
-#   except keys that expect a boolean integer value (1 = True; 0 = False), i.e.
-#   use_tls = 1.
+#   but keys that expect a boolean integer value (1 = True; 0 = False), i.e. use_tls = 1.
+#
+# Notes:
+#   To connect to a server securely with TLS, the 'use_tls' key must be set to 1,
+#   and 'port' set to a TLS port accepted by the server.
+#   To connect with a self-signed certificate, both 'tls_cert' and 'tls_key' need
+#   to be specified.
+#   See:
+#     https://libera.chat/guides/certfp
+#     https://www.oftc.net/NickServ/CertFP/
+#     https://stackoverflow.com/a/10176685
 
 [server]
 
@@ -18,11 +27,21 @@ usermode   = '+IG'
 server     = 'irc.libera.chat'
 port       = '6697'
 use_tls    = 1
+tls_cert   = '/home/user/pcre2bot/tls/libera.cer'
+tls_key    = '/home/user/pcre2bot/tls/libera.key'
 debug      = 1
 debug_plug = 1
 
-# Hardcoding passwords in plaintext is bad. It's just temporary for testing before
-# the stable release.
+# Hardcoding passwords in plaintext is bad practice, prefer to authenticate with
+# a self-signed TLS certificate over a password.
+#
+# If a password is a must:
+#   1. It can be set it with the --pass option, that accepts STDIN; so it will
+#      prompt for the secret interactively. It can also be piped with a password
+#      manager (e.g. pass libera/pcre2bot | pcre2bot -p).
+#   2. Or set it in NICKSERV_PASS environment variable.
+#
+# All alternatives have preference over the password in config file.
 nickserv_password = ''
 
 # Auto-join channels

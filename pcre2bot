@@ -10,7 +10,7 @@
 #   to pcre2test, then runs regex tests and displays the results in the channel.
 #
 # Usage:
-#   pcre2bot config_file
+#   See 'pcre2bot --help'.
 #
 # References:
 #   https://www.rfc-editor.org/rfc/rfc1459
@@ -37,6 +37,9 @@
 #     installed because it's failing the tests.
 #     Net::SSLeay also is failing its tests.
 #
+#   - The NICKSERV_PASS environment variable can be set, so the script will prefer
+#     it over the config file password.
+#
 #   - pcre2bot uses Unix convention of exit codes, i.e. 0 success, 1 general failure,
 #     2 command-line usage error.
 #
@@ -47,36 +50,23 @@
 #
 #   - Think of ways of securing the bot e.g. sandboxing using virtualization,
 #     linux namespaces, containers, etc.
-#     Will pcre2test need to be limited to avoid abuse? Or use a configuration file
-#     to let the user choose.
-#     Ignore private messages from non-channel users with umode +G to avoid abuse?
-#     +G is a Libera specific user mode, so do not set it by default but in configuration.
-#     Perhaps a rate limit is better than ignoring all pms? The bot also should
-#     be rate limited to avoid spam/flood. WeeChat uses 2 seconds in irc.server_default.anti_flood
-#     option.
-#
-#   - Add configuration file.
-#   - Add error handlings rather than just 'die', use exit codes in UNIX style.
-#   - Maybe add some command-line options, think of useful ones.
-#     Add a help and version options.
-#
-#   - Figure out how the nick passwords should be handled. Perhaps store a password
-#     hash in config file, then decrypt it in the script?
-#     It has to support interactive use, so 'pass' can be used.
 #
 #   - Add bot logging, configurable by the user. Log only relevant events that
 #     has relation with bot nick, e.g. privmsg messages, kick, ban, errors, etc.
 #
 #   - Study simpleclient.pl on how it accepts user inputs, so bot can be interactive.
-#   - Perhaps add daemon functionality.
-#   - Try to connect the bot with Tor. SOCKS5 seems not supported, so maybe open
-#     a feature issue to PoCo-IRC?
+#   - Add daemon functionality.
+#   - Try to connect the bot with Tor. SOCKS5 is not supported, so maybe open a
+#     feature issue to PoCo-IRC?
+#     It seems Libera Chat only supports Tor with SASL, and PoCo-IRC does not
+#     support SASL.
+#
+#   - Maybe add netcat support for pastebin services, so services that rely on
+#     'nc' can be used.
+#   - Add bash tab completions.
 #   - Study ways of how the bot can be deployed in a server.
-#   - After POE script is done, try to reimplement it with a framework that supports
-#     TLS, i.e. Mojo::IRC. It would be neat to use a self-signed cert to avoid
-#     passwords.
-#   - When bot is finished and stable, perhaps ask for permission on libera's #regex
-#     to have it +v.
+#   - After POE script is done, maybe try to reimplement it with another framework,
+#     e.g. Mojo::IRC.
 #   - Add an AUR pcre2bot package.
 
 use v5.26.0;
@@ -85,7 +75,10 @@ use strict;
 use warnings;
 use open qw< :std :encoding(UTF-8) >;  # Encode STDIN, STDOUT and STDERR to UTF-8.
 
+use I18N::Langinfo        qw< langinfo CODESET >;
+use Encode                qw< decode >;
 use File::Basename;
+use Getopt::Long          qw< GetOptions :config gnu_getopt >;
 use TOML::Tiny            qw< from_toml to_toml >;
 use POE                   qw<
                               Wheel::Run
@@ -103,10 +96,34 @@ END { close STDOUT or die $! }
 
 # Global variables
 
+# Get the locale encoding and decode the command-line arguments.
+{
+    my $codeset = langinfo(CODESET);
+    @ARGV = map { decode $codeset, $_ } @ARGV;
+}
+
 $|++;  # Disable STDOUT buffering.
 
 my $prog     = basename $0;
 my $prog_ver = '0.1';
+
+my $usage = <<~"END";
+    Usage: $prog [OPTION]... CONFIG_FILE
+    pcre2test IRC bot
+    IRC bot that listens to specific user commands in a IRC channel, sends them
+    to pcre2test, then runs regex tests and displays the results in the channel.
+
+    Options:
+      -h, --help               show this help and exit
+      -p, --pass               accepts STDIN as NickServ password
+      -v, --version            show version info and exit
+
+    Examples:
+      $prog -p CONFIG_FILE
+    END
+
+# Options
+my $pass = 0;
 
 # Configuration
 my $config;
@@ -117,6 +134,8 @@ my $usermode          = '';
 my $server            = '';
 my $port              = '';
 my $tls               = 0;
+my $tls_cert          = '';
+my $tls_key           = '';
 my $debug             = 0;
 my $debug_plug        = 0;
 my $nickserv_pass     = '';
@@ -146,6 +165,7 @@ my $mod_short_rgx = qr/\b(?> [agimnrsBI]++ | x{1,2}+)++\b/x;
 # Flags
 my $conv_uniq    = 0;  # Unique conversion ('replace' modifier)
 my $subj_literal = 0;  # subject_literal modifier
+my $no_service   = 0;  # Primary pastebin service
 
 # Utils
 
@@ -156,15 +176,6 @@ sub err
 
     print STDERR "${prog}: ${msg}\n";
     exit $code;
-}
-
-# Check if pcre2test is installed on user's system.
-sub check_pcre2test
-{
-    # Exit with an error if pcre2test is not found on $PATH.
-    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
-
-    err 1, 'pcre2test is not installed' if (($? >> 8) > 0);
 }
 
 # Auto-join channels
@@ -206,14 +217,8 @@ sub _start
     $heap->{connector} = POE::Component::IRC::Plugin::Connector->new();
     $irc->plugin_add('Connector' => $heap->{connector});
 
-    $irc->plugin_add('NickServID', POE::Component::IRC::Plugin::NickServID->new(
-        'Password' => $nickserv_pass,
-    ));
     $irc->yield(register => 'all');
     $irc->yield(connect  => {});
-
-    $irc->yield(mode => "$nickname $usermode") if $usermode ne '';
-    join_channels() if $nickserv_pass eq '';
 
     return;
 }
@@ -238,7 +243,6 @@ sub _start
 #    return;
 #}
 
-my $no_service = 0;
 # Handle pcre2test's STDOUT events.
 sub got_child_stdout
 {
@@ -395,20 +399,27 @@ sub _response
 # Events
 
 # Server welcome message
-#sub irc_001
-#{
-#    my $sender = $_[SENDER];
-#
-#    # Since this is an irc_* event, we can get the component's object by
-#    # accessing the heap of the sender. Then we register and connect to the
-#    # specified server.
-#    my $irc = $sender->get_heap();
-#    print 'Connected to ', $irc->server_name(), "\n";
-#
-#    return;
-#}
+# Note that this event is necessary to start sending commands to the server.
+sub irc_001
+{
+    my $sender = $_[SENDER];
+    my $irc = $sender->get_heap();
 
-# If a NickServ password is given, only join channels after the nick is identified,
+    print 'Connected to ', $irc->server_name(), "\n";
+
+    # Identify to NickServ if a password is set.
+    $irc->plugin_add('NickServID', POE::Component::IRC::Plugin::NickServID->new(
+        'Password' => $nickserv_pass,
+    )) if $nickserv_pass ne '' && $tls_cert eq '';
+
+    $irc->yield(mode => "$nickname $usermode") if $usermode ne '';
+    $irc->yield(whois => $nickname);
+    join_channels() if $nickserv_pass eq '';
+
+    return;
+}
+
+# If a NickServ password is set, only join channels after the nick is identified,
 # so the hostname is not exposed before a cloak is set on some servers (e.g. Libera
 # Chat and OFTC).
 sub irc_identified
@@ -417,6 +428,8 @@ sub irc_identified
     my $irc    = $sender->get_heap();
 
     print "Nick is identified, joining channels.\n";
+    #$irc->yield(nickserv => 'CERT ADD');
+    #$irc->yield(whois => $nickname);
     join_channels();
 }
 
@@ -1158,6 +1171,140 @@ sub get_pastebin
     return;
 }
 
+sub set_options
+{
+    # Transform options warn messages.
+    local $SIG{__WARN__} = sub {
+        chomp (my $msg = shift);
+
+        if ($msg =~ /\AUse of uninitialized value /) {
+            print $msg;
+            return;
+        }
+
+        $msg =~ tr/"/'/;
+        err 2, "\L$msg\E";
+    };
+
+    GetOptions(
+        'help|h'    => sub { print $usage; exit 0 },
+        'pass|p'    => \$pass,
+        'version|v' => sub { print "$prog ${prog_ver}\n"; exit 0 },
+    );
+
+    if ($pass) {
+        print "Sending password to STDIN\n";
+
+        # Non-interactive STDIN
+        if (! -t STDIN) {
+            chomp ($nickserv_pass = <STDIN>);
+        }
+        # STDIN is opened to a TTY.
+        else {
+            print 'Enter NickServ password: ';
+
+            # Disable TTY echo.
+            system('/usr/bin/stty', '-echo'); die $! if ($? >> 8) > 0;
+
+            chomp ($nickserv_pass = <STDIN>);
+
+            system('/usr/bin/stty', 'echo'); die $! if ($? >> 8) > 0;
+        }
+    }
+}
+
+# Configuration
+
+# Initialize config file.
+sub init_config
+{
+    my $config_file = shift @ARGV or err 2, 'missing config file argument';
+    err 2, 'config file does not exist' unless -e $config_file;
+    open my $fh, '<', $config_file or err 1, "failed to open $config_file";
+
+    # Decode TOML config.
+
+    my $toml = do { local $/; <$fh> };
+    close $fh or warn $!;
+    ($config, my $error) = from_toml($toml);
+
+    if ($error ne '') {
+        chomp $error;
+        err 1, "failed to decode config file\n$error";
+    }
+
+    print Dumper $config;
+}
+
+# Set config TLS variable and check its certificate.
+sub set_config_tls
+{
+    $tls      = $config->{server}->{use_tls};
+    $tls_cert = $config->{server}->{tls_cert};
+    $tls_key  = $config->{server}->{tls_key};
+
+    if ($tls_cert ne '' && $tls_key eq '') {
+        err 1, 'missing certificate key';
+    }
+    elsif ($tls_key ne '' && $tls_cert eq '') {
+        err 1, 'missing certificate';
+    }
+    elsif ($tls_cert ne '' && $tls_key ne '') {
+        err 1, "'tls' key value must be set to 1" unless $tls;
+        err 2, 'NickServ password is unnecessary with a TLS cert' if $pass && $nickserv_pass ne '';
+    }
+}
+
+# Get environment variables.
+sub get_env_vars
+{
+    if (defined $ENV{NICKSERV_PASS} && $nickserv_pass eq '' && $tls_cert eq '') {
+        print "Getting NICKSERV_PASS environment variable\n";
+        $nickserv_pass = $ENV{NICKSERV_PASS};
+    }
+}
+
+# Set config variables.
+sub set_config_vars
+{
+    $nickname      = $config->{server}->{nickname};
+    $username      = $config->{server}->{username};
+    $ircname       = $config->{server}->{ircname};
+    $usermode      = $config->{server}->{usermode};
+    $server        = $config->{server}->{server};
+    $port          = $config->{server}->{port};
+    $debug         = $config->{server}->{debug};
+    $debug_plug    = $config->{server}->{debug_plug};
+    $nickserv_pass = $config->{server}->{nickserv_password} if $nickserv_pass eq '' && $tls_cert eq '';
+    @channels      = ($config->{server}->{channels}->@*);
+
+    # Name lists (~username@host)
+    @names_allow  = ($config->{server}->{names_allow}->@*);
+    @names_ignore = ($config->{server}->{names_ignore}->@*);
+
+    # Default options modifiers
+    $def_pat_mods  = $config->{pcre2test}->{pattern_modifiers};
+    $def_subj_mods = $config->{pcre2test}->{subject_modifiers};
+
+    # Modifiers allow lists
+    @pat_mods_allow  = ($config->{pcre2test}->{pattern_mods_allow}->@*);
+    @subj_mods_allow = ($config->{pcre2test}->{subject_mods_allow}->@*);
+
+    # Pastebin services
+    $max_lines         = $config->{pcre2test}->{max_lines};
+    $primary_service   = $config->{pcre2test}->{primary_service};
+    @fallback_services = ($config->{pcre2test}->{fallback_services}->@*);
+}
+
+# Check if pcre2test is installed on user's system.
+sub check_pcre2test
+{
+    # Exit with an error if pcre2test is not found on $PATH.
+    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
+
+    err 1, 'pcre2test is not installed' if (($? >> 8) > 0);
+}
+
 # POE
 
 # Initialize POE framework objects.
@@ -1170,7 +1317,9 @@ sub init_poe
         ircname      => $ircname,
         server       => $server,
         port         => $port,
-        UseSSL       => $tls,
+        usessl       => $tls,
+        sslcert      => $tls_cert,
+        sslkey       => $tls_key,
         debug        => $debug,
         plugin_debug => $debug_plug,
     ) or die "failed to create PoCo-IRC object $!";
@@ -1181,6 +1330,7 @@ sub init_poe
             main => [
                 qw<
                     _start
+                    irc_001
                     irc_identified
                     irc_public
                     irc_msg
@@ -1205,66 +1355,11 @@ sub init_poe
     ) or die "failed to create PoCo-Curl object $!";
 }
 
-# Configuration
-
-# Initialize config file.
-sub init_config
-{
-    my $config_file = shift @ARGV or err(2, 'missing config file argument');
-    err(2, 'config file does not exist') unless -e $config_file;
-    open my $fh, '<', $config_file or err(1, "failed to open $config_file");
-
-    # Decode TOML config.
-
-    my $toml = do { local $/; <$fh> };
-    close $fh or warn $!;
-    ($config, my $error) = from_toml($toml);
-
-    if ($error ne '') {
-        chomp $error;
-        err(1, "failed to decode config file\n$error");
-    }
-
-    print Dumper $config;
-}
-
-# Set config variables.
-sub set_config_vars
-{
-    $nickname      = $config->{server}->{nickname};
-    $username      = $config->{server}->{username};
-    $ircname       = $config->{server}->{ircname};
-    $usermode      = $config->{server}->{usermode};
-    $server        = $config->{server}->{server};
-    $port          = $config->{server}->{port};
-    $tls           = $config->{server}->{use_tls};
-    $debug         = $config->{server}->{debug};
-    $debug_plug    = $config->{server}->{debug_plug};
-    $nickserv_pass = $config->{server}->{nickserv_password};
-    @channels      = ($config->{server}->{channels}->@*);
-
-    # Name lists (~username@host)
-    @names_allow  = ($config->{server}->{names_allow}->@*);
-    @names_ignore = ($config->{server}->{names_ignore}->@*);
-
-    # Default options modifiers
-    $def_pat_mods  = $config->{pcre2test}->{pattern_modifiers};
-    $def_subj_mods = $config->{pcre2test}->{subject_modifiers};
-
-    # Modifiers allow lists
-    @pat_mods_allow  = ($config->{pcre2test}->{pattern_mods_allow}->@*);
-    @subj_mods_allow = ($config->{pcre2test}->{subject_mods_allow}->@*);
-
-    # Pastebin services
-    #
-    # TODO: Perhaps add netcat support, so services that rely on 'nc' can be used.
-    $max_lines         = $config->{pcre2test}->{max_lines};
-    $primary_service   = $config->{pcre2test}->{primary_service};
-    @fallback_services = ($config->{pcre2test}->{fallback_services}->@*);
-}
-
 # Main
+set_options();
 init_config();
+set_config_tls();
+get_env_vars();
 set_config_vars();
 check_pcre2test();
 init_poe();
