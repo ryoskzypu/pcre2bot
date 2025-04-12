@@ -7,6 +7,7 @@
 # Usage:
 #   All keys values that expect a string must be quoted, i.e. nickname = 'pcre2bot',
 #   but keys that expect a boolean integer value (1 = True; 0 = False), i.e. use_tls = 1.
+#   To enable the logger, just set a path where the logs should be saved.
 #
 # Notes:
 #   To connect to a server securely with TLS, the 'use_tls' key must be set to 1,
@@ -20,17 +21,18 @@
 
 [server]
 
-nickname   = 'pcre2bot'
-username   = 'ryoskzypu'
-ircname    = 'pcre2test IRC bot'
-usermode   = '+IG'
-server     = 'irc.libera.chat'
-port       = '6697'
-use_tls    = 1
-tls_cert   = '/home/user/pcre2bot/tls/libera.cer'
-tls_key    = '/home/user/pcre2bot/tls/libera.key'
-debug      = 1
-debug_plug = 1
+nickname    = 'pcre2bot'
+username    = 'ryoskzypu'
+ircname     = 'pcre2test IRC bot'
+usermode    = '+IG'
+server      = 'irc.libera.chat'
+port        = '6697'
+use_tls     = 1
+tls_cert    = '/home/user/pcre2bot/tls/libera.cer'
+tls_key     = '/home/user/pcre2bot/tls/libera.key'
+log_path    = ''
+log_private = 1
+log_public  = 1
 
 # Hardcoding passwords in plaintext is bad practice, prefer to authenticate with
 # a self-signed TLS certificate over a password.
