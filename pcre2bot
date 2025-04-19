@@ -13,16 +13,31 @@
 #   See 'pcre2bot --help'.
 #
 # Commands:
-#   pcre2bot runs input commands prepended with a slash, e.g. /connect.
+#   pcre2bot can act as a simple IRC client and run input commands prepended with
+#   a slash, e.g. /connect.
 #
 #   See https://metacpan.org/pod/POE::Component::IRC#INPUT-EVENTS for the complete
 #   list of PoCo-IRC commands.
 #
 #   New commands:
-#     /msg              alias of /privmsg
-#     /reconnect        reconnect to the current connected server
-#     /dumpstate        dump current IRC state info
-#
+#     /ban        #channel [nick...]              ban nicks or hosts
+#     /cycle      #channel,... [message]          leave and rejoin channels
+#     /dehalfop   #channel nick...                remove channel half-operator status from nicks
+#     /deop       #channel nick...                "              operator      "
+#     /devoice    #channel nick...                "              voice         "
+#     /dumpstate                                  dump current IRC state info
+#     /halfop     #channel nick...                give channel half-operator status to nicks
+#     /help                                       show /commands usage
+#     /kickban    #channel nick [reason]          kick a user from channel and ban its host
+#     /me         #channel,... message            send a CTCP action to channels or nicks
+#     /msg        #channel,... message            alias of /privmsg
+#     /op         #channel nick...                give channel operator status to nicks
+#     /quiet      #channel [nick...]              quiet nicks or hosts
+#     /reconnect                                  reconnect to the current connected server
+#     /run        -a | -c=#channel,... command    run a command on all joined channels or specific channels
+#     /unban      #channel nick...                unban nicks or hosts
+#     /unquiet    #channel nick...                unquiet "
+#     /voice      #channel nick...                give channel voice status to nicks
 #
 # References:
 #   https://www.rfc-editor.org/rfc/rfc1459
@@ -65,7 +80,11 @@
 #   - Study POE, and POE::Component::IRC, Mojo::IRC, AnyEvent::IRC.
 #   - Study perlbot, shbot, and greybot to get ideias of useful features to implement.
 #
+#   - Find and add useful IRC capabilities like account-tag, echo-message, etc.
 #   - Add daemon functionality and find how the bot can be controled in background.
+#
+#   - Study on how to implement perl modules/packages to the script, because it's
+#     too long.
 #
 #   - Try to connect the bot with Tor. SOCKS5 is not supported, so maybe open a
 #     feature issue to PoCo-IRC?
@@ -107,6 +126,7 @@ use POE                   qw<
                               Component::IRC::Plugin::Logger
                               Component::Curl::Multi
                           >;
+use IRC::Utils            qw< parse_user matches_mask >;
 use HTTP::Request::Common qw< POST >;
 use Data::Dumper          qw< Dumper >;
 use POSIX                 qw< strftime >;
@@ -151,18 +171,104 @@ my $usage = <<~"END";
     to pcre2test, then runs regex tests and displays its results in the channel.
 
     Options:
-      -d, --debug              show debug information
-      -h, --help               show this help and exit
-      -p, --pass               accepts STDIN as NickServ password
-      -v, --version            show version info and exit
+          --ac, --auto-conn auto-connect to server on start
+      -d, --debug           show debug info
+      -h, --help            show this help and exit
+      -p, --pass            accepts STDIN as NickServ password
+      -v, --version         show version info and exit
 
     Examples:
-      $prog -p CONFIG_FILE
+      $prog --ac CONFIG_FILE
+    END
+
+my $commands = <<~'END';
+    Commands:
+      See https://metacpan.org/pod/POE::Component::IRC#INPUT-EVENTS for the complete
+      description of PoCo-IRC commands.
+
+      /admin      [server]                                          query server's admin info
+      /away       [message]                                         set or remove away status
+      /cap        end | ls | list | ack cap... | req cap...         query/enable/disable IRC protocol capabilities
+      /connect                                                      connect to the server from config file
+      /ctcp       #channel,... message                              send a CTCP query to channels or nicks
+      /ctcpreply  #channel,... message                              "           reply "
+      /dcc        nick send file [blksize] [timeout] | nick chat    send a DCC SEND or CHAT request to a nick
+      /dcc_accept cookie [file]                                     accept an incoming DCC connection from another host
+      /dcc_chat   id data                                           send lines of data to a nick
+      /dcc_close  id                                                terminate a DCC SEND or GET connection, and close DCC CHAT connections
+      /dcc_resume cookie [file]                                     resume a DCC SEND file transfer
+      /debug      [1 | 0]                                           turn POE's debugging mode on or off
+      /die                                                          tell server to shutdown
+      /info       [server]                                          query server's info
+      /invite     nick #channel                                     invite nick to a channel
+      /ison       nick...                                           check if nicks are currently online
+      /join       #channel [key]                                    join a channel
+      /kick       #channel nick [message]                           kick a user from channel
+      /links      [[server] mask]                                   query list of servers connected to the IRC network
+      /list       [#channel...]                                     list visible channels and their topics
+      /locops     message                                           send a message to all local-opers (+l) on EFNet
+      /mode       #channel mode [mask]                              change a channel or nick mode
+      /motd                                                         query server's 'Message of the Day'
+      /names      #channel...                                       list nicks from channels
+      /nick       nick                                              change current nick
+      /nickserv   ...                                               send a message to NickServ
+      /notice     #channel,... message                              send a notice message to channels or nicks
+      /oper       user password                                     get server's operator privileges
+      /operwall   message                                           send a message to all global opers on EFNet
+      /part       #channel,... message                              leave channels
+      /ping       server                                            send a ping to server
+      /pong       server                                            answer a ping message
+      /privmsg    #channel,... message                              send a message to channels or nicks
+      /quit       [message]                                         disconnect from server
+      /quote      string                                            send a raw string to server
+      /register   event,...                                         register events to POE's session
+      /rehash                                                       tell server to reload its config file
+      /remove     #channel nick [message]                           force a nick to leave a channel
+      /restart                                                      tell server to restart itself
+      /sconnect   server [port] [remote]                            tell a server to connect to another
+      /servlist   [mask [type]]                                     list services currently connected to the network
+      /shutdown   [message [timeout]]                               disconnect from server and shutdown POE's session
+      /squery     #channel,... message                              send a message to a service
+      /squit      server message                                    disconnect server links
+      /stats      [query [server]]                                  query statistics about server
+      /summon     user [server [#channel]]                          give users from server a message asking them to please join IRC
+      /time       [server]                                          query local time from server
+      /topic      #channel [string]                                 get or set a channel's topic
+      /trace      [server]                                          find the route to a server or nick
+      /unregister event,...                                         unregister events from POE's session
+      /userhost   nick...                                           query info about nicks
+      /users      [server]                                          query count of users that are logged-in to a server
+      /version    [server]                                          query server's version info
+      /wallops    message                                           send a message to all opers (and +w users)
+      /who        [name [o]]                                        query list of users that match a name
+      /whois      [nick...]                                         query info about nicks or hostmasks
+      /whowas     nick [count [server]]                             query info about offline nick
+
+    New commands:
+      /ban        #channel [nick...]              ban nicks or hosts
+      /cycle      #channel,... [message]          leave and rejoin channels
+      /dehalfop   #channel nick...                remove channel half-operator status from nicks
+      /deop       #channel nick...                "              operator      "
+      /devoice    #channel nick...                "              voice         "
+      /dumpstate                                  dump current IRC state info
+      /halfop     #channel nick...                give channel half-operator status to nicks
+      /help                                       show /commands usage
+      /kickban    #channel nick [reason]          kick a user from channel and ban its host
+      /me         #channel,... message            send a CTCP action to channels or nicks
+      /msg        #channel,... message            alias of /privmsg
+      /op         #channel nick...                give channel operator status to nicks
+      /quiet      #channel [nick...]              quiet nicks or hosts
+      /reconnect                                  reconnect to the current connected server
+      /run        -a | -c=#channel,... command    run a command on all joined channels or specific channels
+      /unban      #channel nick...                unban nicks or hosts
+      /unquiet    #channel nick...                unquiet "
+      /voice      #channel nick...                give channel voice status to nicks
     END
 
 # Options
-my $debug = 0;
-my $pass  = 0;
+my $auto_conn = 0;
+my $debug     = 0;
+my $pass      = 0;
 
 # Configuration
 my $config;
@@ -180,8 +286,8 @@ my $log_private       = 0;
 my $log_public        = 0;
 my $nickserv_pass     = '';
 my @channels          = ();
-my @names_allow       = ();
-my @names_ignore      = ();
+my @userhosts_allow   = ();
+my @userhosts_ignore  = ();
 my $def_pat_mods      = '';
 my $def_subj_mods     = '';
 my @pat_mods_allow    = ();
@@ -193,8 +299,9 @@ my @fallback_services = ();
 # Log filehandle
 my $log_fh;
 
-# pcre2bot's '~username@hostname' that IRC server sees.
-my $fullname;
+# pcre2bot's userhost and fullnick that IRC server sees.
+my $userhost;  # ~user@host
+my $fullnick;  # nick!~user@host
 
 # pcre2test's output lines
 my @lines;
@@ -219,11 +326,33 @@ sub err
     my ($code, $msg) = @_;
 
     print STDERR "${prog}: ${msg}\n";
+
+    $readline = '';
     exit $code;
 }
 
 # Auto-join channels
 sub join_channels { $irc->yield(join => $_) foreach @channels }
+
+# Print debug message.
+sub pdbg
+{
+    return unless $debug;
+    my ($msg) = @_;
+
+    $readline->put($msg);
+}
+
+# Print Dumper formated output.
+sub pdump
+{
+    return unless $debug;
+
+    my ($str, $ref) = @_;
+
+    # Newlines need to be stripped to be correctly shown on POE's ReadLine output.
+    $readline->put($_) foreach (split /\n/, "$str = " . Dumper $ref);
+}
 
 # Print a message with a timestamp to STDOUT or log file.
 sub plog
@@ -246,49 +375,109 @@ sub pmsg
     plog(1, 1, $msg) if $log_path ne '';
 }
 
-# Print debug message.
-sub pdbg
+# Dump PRIVMSG messages for debugging.
+sub dump_privmsg
 {
-    return unless $debug;
-    my ($msg) = @_;
+    my ($message) = @_;
+    my @bytes = split //, $message;
 
-    $readline->put($msg);
+    @bytes = map { conv_chars($_) } @bytes;
+    my $dumped_msg = join '', @bytes;
+
+    pdbg qq{\$dumped_msg: "${dumped_msg}"};
 }
 
-# Print Dumper formated output.
-sub pdump
+# Convert non-printable chars to their escaped, octal, or hex representation.
+# E.g. \t, \o{011}, or \x{09} respectively. See ascii(7).
+sub conv_chars
 {
-    return unless $debug;
+    my $char = shift;
 
-    my ($str, $ref) = @_;
+    # Decimal to escaped chars table
+    my %esc_chars = (
+        '0'  => '\0',
+        '7'  => '\a',
+        '8'  => '\b',
+        '9'  => '\t',
+        '10' => '\n',
+        '11' => '\v',
+        '12' => '\f',
+        '13' => '\r',
+    );
 
-    # Newlines need to be stripped to be correctly shown on POE's ReadLine output.
-    $readline->put($_) foreach (split /\n/, "$str = " . Dumper $ref);
+    # Control but escaped chars
+    if ($char =~ /\A[\x{01}-\x{06}\x{0e}-\x{1f}]\z/) {
+        return sprintf "\\o{%03o}", ord $char;  # Octal
+    }
+    # Escaped
+    elsif ($char =~ /\A[\x{00}\x{07}-\x{0d}]\z/) {
+        return sprintf '%s', $esc_chars{ord $char};
+    }
+    # Printable ASCII (7-bit)
+    elsif ($char =~  /\A[\x{20}-\x{7e}]\z/) {
+        return $char;
+    }
+    # Non-printable ASCII and non-ASCII (Unicode)
+    else {
+        return sprintf "\\x{%x}", ord $char;  # Hex
+    }
 }
 
-# Check if name (~username@host) is allowed to run bot commands.
-sub is_name_allowed
+# Convert Unix epoch time to human-readable date.
+sub conv_date
 {
-    my ($name) = @_;
+    my ($epoch) = @_;
+
+    # E.g. Wed, 16 Apr 2025 06:49:34
+    return strftime "%a, %d %b %Y %T", localtime $epoch;
+}
+
+# Check if userhost (~user@host) is allowed to run bot commands.
+sub is_userhost_allowed
+{
+    my ($userhost) = @_;
 
     # Allow list has priority over the ignore list.
-    if (! @names_allow) {
-        if (grep { $_ eq $name } @names_ignore) {
-            pdbg "Ignored name '${name}' sent a message.";
+    if (! @userhosts_allow) {
+        if (grep { $_ eq $userhost } @userhosts_ignore) {
+            pdbg "Ignored userhost '${userhost}' sent a message.";
             return 0;
         } else {
-            pdbg "Name '${name}' sent a message.";
+            pdbg "Userhost '${userhost}' sent a message.";
             return 1;
         }
     }
 
-    if (grep { $_ eq $name } @names_allow) {
-        pdbg "Allowed name '${name}' sent a message.";
+    if (grep { $_ eq $userhost } @userhosts_allow) {
+        pdbg "Allowed userhost '${userhost}' sent a message.";
         return 1;
     } else {
-        pdbg "Blocked '${name}' sent a message.";
+        pdbg "Blocked '${userhost}' sent a message.";
         return 0;
     }
+}
+
+# Request a mode change on a specific channel.
+sub set_chan_mode
+{
+    my ($args, $action, $mode, $err) = @_;
+    my $channel  = shift $args->@*;
+    my $args_len = scalar $args->@*;
+
+    if (! defined $channel) {
+        warn "Missing channel.\n";
+        return;
+    }
+
+    if (! $args->@*) {
+        warn "Missing ${err}.\n";
+        return;
+    }
+
+    $action .= $mode x $args_len;
+
+    # Set mode
+    $irc->yield(mode => "$channel $action " . join ' ', $args->@*);
 }
 
 # Event handlers
@@ -331,46 +520,58 @@ sub _start
         return (
                    '/admin ',
                    '/away ',
+                   '/ban ',
                    '/cap ',
                    '/connect ',
                    '/ctcp ',
                    '/ctcpreply ',
+                   '/cycle ',
+                   '/dehalfop ',
+                   '/deop ',
+                   '/devoice ',
                    '/dcc ',
                    '/dcc_accept ',
                    '/dcc_chat ',
                    '/dcc_close ',
                    '/dcc_resume ',
                    '/debug ',
-                   '/dumpstate ',
-                   '/die ',
+                   '/dumpstate',
+                   '/die',
+                   '/halfop ',
+                   '/help',
                    '/info ',
                    '/invite ',
                    '/ison ',
                    '/join ',
+                   '/kickban ',
                    '/kick ',
                    '/links ',
                    '/list ',
                    '/locops ',
                    '/mode ',
-                   '/motd ',
+                   '/motd',
+                   '/me ',
                    '/msg ',
                    '/names ',
                    '/nick ',
                    '/nickserv ',
                    '/notice ',
                    '/oper ',
+                   '/op ',
                    '/operwall ',
                    '/part ',
                    '/ping ',
                    '/pong ',
                    '/privmsg ',
+                   '/quiet ',
                    '/quit ',
                    '/quote ',
                    '/register ',
-                   '/rehash ',
+                   '/rehash',
                    '/remove ',
-                   '/reconnect ',
-                   '/restart ',
+                   '/reconnect',
+                   '/restart',
+                   '/run ',
                    '/sconnect ',
                    '/servlist ',
                    '/shutdown ',
@@ -381,10 +582,13 @@ sub _start
                    '/time ',
                    '/topic ',
                    '/trace ',
+                   '/unban ',
+                   '/unquiet ',
                    '/unregister ',
                    '/userhost ',
                    '/users ',
                    '/version ',
+                   '/voice ',
                    '/wallops ',
                    '/who ',
                    '/whois ',
@@ -393,7 +597,7 @@ sub _start
     };
 
     $irc->yield(register => 'all');
-    #$irc->yield(connect  => {});
+    $irc->yield(connect  => {}) if $auto_conn;
 
     return;
 }
@@ -412,11 +616,14 @@ sub _default
                       (?>
                           \d{3}+
                           | bot_public
+                          | bot_msg
                           | cap
+                          | chan_mode
                           | notice
                           | ping
                           | snotice
                           | user_mode
+                          | wallops
                       )
                       \z
                   /x) {
@@ -522,12 +729,19 @@ sub rl_handle_input
 
 # Parse POE's ReadLine inputs to run /commands.
 #
+# References:
+#   https://metacpan.org/pod/POE::Component::IRC#INPUT-EVENTS
+#   https://weechat.org/files/doc/weechat/stable/weechat_user.en.html#irc_commands
+#   https://weechat.org/files/doc/weechat/stable/weechat_user.en.html#weechat_commands
+#   https://libera.chat/guides/channelmodes
+#   https://libera.chat/guides/quickops
+#
 # Notes:
 #   - The input strings are split by spaces, so mentions of 'arguments' means
 #     strings that do not contain spaces, and plain 'string' is the opposite.
 #
-#   - For some reason part, quit and shutdown commands only send the optional
-#     message argument to the server after being connected for some time.
+#   - Some commands, (e.g. privmsg, notice, ctcp, etc) accept multiple channels/nicks
+#     with a comma separator (e.g. /privmsg #chan1,#chan2 message).
 #
 #   - Since arguments are split by spaces, it can cause problems with dcc* commands,
 #     because of filenames that contain spaces. This can be fixed, but pcre2bot
@@ -539,11 +753,8 @@ sub rl_handle_input
 #     that Libera does accept them in 'nickserv set password', 'nickserv identify',
 #     but not in 'nickserv register'.
 #
-# TODO:
-#   - Fix commands arguments in how they are passed. Every command accepts a
-#     different number of args.
-#   - Create a command to check what channels the bot is at. Look into PoCo-IRC-State.
-#   - Check weechat useful commands to see if they can be added here.
+#   - For some reason part, quit and shutdown commands only send the optional
+#     message argument to the server after being connected for some time.
 sub rl_parse_input
 {
     my ($input) = @_;
@@ -554,43 +765,21 @@ sub rl_parse_input
 
         pdump('@args', \@args);
 
-        if ($cmd eq 'connect') {
-            if ($irc->connected) {
-                $readline->put("Already connected to $server");
-            }
-            else {
-                $readline->put("Connecting to $server on port $port");
-                $irc->yield('connect');
-            }
-        }
-        # Dump IRC state info.
-        elsif ($cmd eq 'dumpstate') {
-            pdump('$state', $irc->{STATE});
-        }
         # Commands that take 1 argument and a string.
-        elsif ($cmd =~ /
+        if ($cmd =~ /
                            \A
                            (?>
                                ctcpreply
                                | ctcp
                                | notice
-                               |
-                                 (?'msg'
-                                     privmsg | msg
-                                 )
                                | squery
                                | squit
                            )
                            \z
                        /x) {
-            my $channel = shift @args;
+            my $channels = shift @args;
 
-            if (defined $+{msg}) {
-                $irc->yield(privmsg => $channel => "@args")
-            }
-            else {
-                $irc->yield($cmd => $channel => "@args");
-            }
+            $irc->yield($cmd => $channels => "@args");
         }
         # Commands that take 2 arguments and a string.
         elsif ($cmd =~ /
@@ -615,12 +804,240 @@ sub rl_parse_input
                                | operwall
                                | quit
                                | quote
-                               | mode
                                | wallops
+                               | who
                            )
                            \z
                        /x) {
             $irc->yield($cmd => "@args");
+        }
+        elsif ($cmd eq 'connect') {
+            if ($irc->connected) {
+                warn "Already connected to ${server}\n";
+            }
+            else {
+                $readline->put("Connecting to $server on port $port");
+                $irc->yield('connect');
+            }
+        }
+        # Ban/unban or quiet/unquiet nicks or hosts.
+        #   /ban     #channel [nick...]
+        #   /unban   #channel nick...
+        #
+        #   /quiet   #channel [nick...]
+        #   /unquiet #channel nick...
+        #
+        # If the nick is present in channel, (un)ban/quiet its hostname in a mask i.e. *!*@host.
+        #
+        # Note that the /mode command sets automatic masks wether the victim string
+        # looks like a nick or a @host, (e.g. *!*@host, nick!*@*); it does not if
+        # it is a mask string.
+        # Without argument, show the channel's ban/quiet list.
+        elsif ($cmd =~ /
+                           \A
+                           (?>
+                               (?'unban'   unban)
+                               |
+                               (?'unquiet' unquiet)
+                               |
+                               (?'ban'     ban)
+                               |
+                               (?'quiet'   quiet)
+                           )
+                           \z
+                       /x) {
+            my $channel  = shift  @args;
+            my $args_len = scalar @args;
+            my $action   = '';
+            my $type     = '';
+            my @victim_list;
+
+            if (! defined $channel) {
+                warn "Missing channel.\n";
+                return;
+            }
+
+            # Set mode's action.
+            if (defined $+{unban} || defined $+{unquiet}) {
+                $action = '-';
+            } elsif (defined $+{ban} || defined $+{quiet}) {
+                $action = '+';
+            }
+
+            # Set mode's type.
+            if (defined $+{unban} || defined $+{ban}) {
+                $type = 'b';
+            } elsif (defined $+{unquiet} || defined $+{quiet}) {
+                $type = 'q';
+            }
+
+            if (! @args) {
+                if ($action eq '-') {
+                    warn "Missing nick or host.\n";
+                }
+                # Show channel's ban/quiet list.
+                elsif ($action eq '+') {
+                    if (defined $+{ban}) {
+                        $irc->yield(mode => "$channel $type");
+                    }
+                    elsif (defined $+{quiet}) {
+                        $irc->yield(mode => "$channel $type");
+                    }
+                }
+
+                return;
+            }
+
+            $action .= $type x $args_len;
+
+            # Parse args
+            foreach my $victim (@args) {
+                # If nick is in channel, ban/unban or quiet/unquiet its host in a mask.
+                if ($irc->is_channel_member($channel, $victim)) {
+                    my $nick_info = $irc->nick_info($victim);
+                    my $host      = $nick_info->{Host};
+
+                    pdbg "$victim is in ${channel}.";
+                    pdump('$irc->nick_info', $nick_info);
+
+                    $victim = "*!*\@${host}";
+                }
+
+                push @victim_list, $victim;
+            }
+
+            # Ban/unban
+            $irc->yield(mode => "$channel $action @victim_list");
+        }
+        # Leave channels with an optional message and rejoin them.
+        #   /cycle #channel,... [message]
+        elsif ($cmd eq 'cycle') {
+            my $message  = '';
+            my $args_len = scalar @args;
+
+            if (! @args) {
+                warn "Missing channels.\n";
+                return;
+            }
+
+            # Get /part message if any.
+            if ($args_len > 1 && $args[-1] !~ /\A#/) {
+                $message = pop @args;
+            }
+
+            # Cycle
+            $irc->yield(part => @args, $message);
+            $irc->yield(join => $_) foreach (@args);
+        }
+        # Remove channel half-operator status from nicks
+        #   /dehalfop #channel nick...
+        elsif ($cmd eq 'dehalfop') {
+            set_chan_mode(\@args, '-', 'h', 'nicks');
+        }
+        # Remove channel operator status from nicks
+        #   /deop #channel nick...
+        elsif ($cmd eq 'deop') {
+            set_chan_mode(\@args, '-', 'o', 'nicks');
+        }
+        # Remove channel voice status from nicks.
+        #   /devoice #channel nick...
+        elsif ($cmd eq 'devoice') {
+            set_chan_mode(\@args, '-', 'v', 'nicks');
+        }
+        # Dump IRC state info.
+        elsif ($cmd eq 'dumpstate') {
+            pdump('$state', $irc->{STATE});
+        }
+        # Give channel half-operator status to nicks.
+        #   /halfop #channel nick...
+        elsif ($cmd eq 'halfop') {
+            set_chan_mode(\@args, '+', 'h', 'nicks');
+        }
+        elsif ($cmd eq 'help') {
+            $readline->put($commands);
+        }
+        # Kick a user from channel and ban its host.
+        #   /kickban #channel nick [reason]
+        #
+        # If the nick is present in channel, ban its hostname in a mask i.e. *!*@host,
+        # before the kick.
+        elsif ($cmd eq 'kickban') {
+            my $channel = shift @args;
+
+            if (! defined $channel) {
+                warn "Missing channel.\n";
+                return;
+            }
+
+            if (! @args) {
+                warn "Missing nick.\n";
+                return;
+            }
+
+            my $nick      = shift @args;
+            my $nick_orig = $nick;
+            my $reason    = "@args";
+
+            # If nick is in channel, ban its host in a mask.
+            if ($irc->is_channel_member($channel, $nick)) {
+                my $nick_info = $irc->nick_info($nick);
+                my $host      = $nick_info->{Host};
+
+                pdbg "$nick is in $channel";
+                pdump('$irc->nick_info', $nick_info);
+
+                $nick = "*!*\@${host}";
+            }
+            else {
+                pdbg "$nick is not in $channel";
+            }
+
+            # Ban
+            $irc->yield(mode => "$channel +b $nick");
+
+            # Kick
+            $irc->yield(kick => $channel => $nick_orig => $reason) if $nick ne $nick_orig;
+        }
+        # Send a CTCP action to channels/nicks.
+        #   /me #channel,... message
+        elsif ($cmd eq 'me') {
+            my $channels = shift @args;
+
+            if (! defined $channels) {
+                warn "Missing channels or nicks.\n";
+                return;
+            }
+
+            $irc->yield(ctcp => $channels => 'ACTION ' . "@args");
+        }
+        # Without argument, request a MODE on pcre2bot's nick.
+        elsif ($cmd eq 'mode') {
+            @args ? $irc->yield($cmd => "@args")
+                  : $irc->yield($cmd => $nickname);
+        }
+        # Give channel half-operator status to nick.
+        #   /op #channel nick...
+        elsif ($cmd eq 'op') {
+            set_chan_mode(\@args, '+', 'o', 'nicks');
+        }
+        # Send a public/private message to specific channels or nicks.
+        #   /privmsg #channel,... message
+        #   /msg     "
+        elsif ($cmd =~ /
+                           \A
+                           (?>
+                               privmsg | msg
+                           )
+                           \z
+                       /x) {
+            my $channels = shift @args;
+
+            if (! defined $channels) {
+                warn "Missing channels or nicks.\n";
+                return;
+            }
+
+            $irc->yield(privmsg => $channels => "@args")
         }
         elsif ($cmd eq 'reconnect') {
             if ($irc->connected) {
@@ -628,7 +1045,79 @@ sub rl_parse_input
                 $irc->yield('connect');
             }
             else {
-                $readline->put('Not connected to a server');
+                warn "Not connected to a server.\n";
+            }
+        }
+        # Run a command on all joined channels or specific channels.
+        #   /run -a | -c=#channel,... command
+        #
+        # Note that it is only useful for some commands that do not accept multiple
+        # channels.
+        elsif ($cmd eq 'run') {
+            my $option  = shift @args;
+            my $cmdname = shift @args;
+            my $all     = 0;
+            my @channels;
+
+            # Parse options
+            #
+            # Note that options are 'short' because POE's ReadLine does not tab-complete
+            # multiple options.
+            if (defined $option) {
+                # All channels
+                if ($option eq '-a') {
+                    $all = 1;
+                }
+                # Specific channels
+                elsif ($option =~ /\A-c=\K[^\x{20}]*+\z/) {
+                    @channels = split /,/, $&;
+                    pdump('@channels', \@channels);
+
+                    if (! @channels) {
+                        warn "Missing channels.\n";
+                        return;
+                    }
+                }
+                else {
+                    warn "Invalid '${option}' option.\n";
+                    return;
+                }
+            }
+
+            if (! defined $cmdname) {
+                warn "Missing command argument.\n";
+                return;
+            }
+
+            # Do not accept 'run' command to avoid infinite recursion.
+            if (defined $cmdname && $cmdname eq '/run') {
+                warn "/run command is not valid.\n";
+                return;
+            }
+
+            # Run
+            if ($all) {
+                if (! $irc->channels->%*) {
+                    warn "pcre2bot has not joined in any channel.\n";
+                    return;
+                }
+
+                pdump('$irc->channels', $irc->channels);
+
+                # Iterate on currently joined channels.
+                foreach my $channel (keys $irc->channels->%*) {
+                    my $command = "$cmdname $channel @args";
+
+                    pdbg "Running '${command}' on $channel";
+                    rl_parse_input($command);
+                }
+            } else {
+                foreach my $channel (@channels) {
+                    my $command = "$cmdname $channel @args";
+
+                    pdbg "Running '${command}' on $channel";
+                    rl_parse_input($command);
+                }
             }
         }
         elsif ($cmd eq 'topic') {
@@ -648,13 +1137,15 @@ sub rl_parse_input
                 $irc->yield($cmd => $channel);
             }
         }
-        # Without argument, do a whois on pcre2bot nick.
+        # Give channel voice status to nicks.
+        #   /voice #channel nick...
+        elsif ($cmd eq 'voice') {
+            set_chan_mode(\@args, '+', 'v', 'nicks');
+        }
+        # Without argument, request a WHOIS on pcre2bot's nick.
         elsif ($cmd eq 'whois') {
-            if (@args) {
-                $irc->yield($cmd => @args);
-            } else {
-                $irc->yield($cmd => $nickname);
-            }
+            @args ? $irc->yield($cmd => @args)
+                  : $irc->yield($cmd => $nickname);
         }
         # Commands that take N arguments.
         else {
@@ -782,6 +1273,95 @@ sub got_child_signal
 
 # Events
 
+# Server welcome message
+# Note that this event is necessary to start sending commands to the server.
+sub irc_001
+{
+    #my $heap   = $_[HEAP];
+    my $server = $irc->server_name;
+
+    $connected     = 1;
+    $was_connected = 1;
+    pmsg "Connected to $server";
+
+    # Identify to NickServ if a password is set.
+    $irc->plugin_add('NickServID', POE::Component::IRC::Plugin::NickServID->new(
+        'Password' => $nickserv_pass,
+    )) if $nickserv_pass ne '' && $tls_cert eq '';
+
+    $irc->yield(mode  => "$nickname $usermode") if $usermode ne '';
+    $irc->yield(whois => $nickname)             if $nickserv_pass eq '';
+
+    join_channels() if $nickserv_pass eq '';
+
+    return;
+}
+
+# Print channel's creation time in human-readable format.
+sub irc_329
+{
+    # E.g. ':calcium.libera.chat 329 pcre2bot #linux 1621426414'
+    my ($server, $raw_msg, $msg_ref) = @_[ARG0 .. ARG2];
+    my ($channel, $time) = $msg_ref->@*;
+
+    $time = conv_date($time);
+
+    pdump('$msg_ref', $msg_ref);
+    plog(0, 0, "Channel $channel created on $time");
+}
+
+# Print channel's topic 'setby time' in human-readable format.
+sub irc_333
+{
+    # E.g. ':zirconium.libera.chat 333 pcre2bot #linux nkukard 1722815284'
+    my ($server, $raw_msg, $msg_ref) = @_[ARG0 .. ARG2];
+    my ($channel, $setby, $time) = $msg_ref->@*;
+
+    $time = conv_date($time);
+
+    pdump('$msg_ref', $msg_ref);
+    plog(0, 0, "Topic for $channel set by $setby on $time");
+}
+
+# Show channel's ban list in a human-readable format.
+sub irc_367
+{
+    # E.g. ':tungsten.libera.chat 367 ryoskzypu #ryoskzypu *!*@user/foo ryoskzypu!~ryoskzypu@user/ryoskzypu 1744759984'
+    my ($server, $raw_msg, $msg_ref) = @_[ARG0 .. ARG2];
+    my ($channel, $victim, $setby, $setat) = $msg_ref->@*;
+
+    $setat = conv_date($setat);
+
+    pdump('$msg_ref', $msg_ref);
+    plog(0, 0, "$victim banned by $setby on $setat");
+}
+
+# Log when someone is messaging pcre2bot and it has +g umode set (+g or +G on Libera
+# and +g, +G, or +j on OFTC).
+sub irc_718
+{
+    my ($server, $raw_msg, $msg_ref) = @_[ARG0 .. ARG2];
+    my $nick     = $msg_ref->[0];
+    my $userhost = $msg_ref->[1];
+    my $message  = $msg_ref->[2];
+
+    plog(1, 1, "$nick $userhost $message") if $log_path ne '';
+    return;
+}
+
+# Show channel's quiet list in a human-readable format.
+sub irc_728
+{
+    # E.g. ':tungsten.libera.chat 728 ryoskzypu #ryoskzypu q *!*@user/foo ryoskzypu!~ryoskzypu@user/ryoskzypu 1744759984'
+    my ($server, $raw_msg, $msg_ref) = @_[ARG0 .. ARG2];
+    my ($channel, $mode, $victim, $setby, $setat) = $msg_ref->@*;
+
+    $setat = conv_date($setat);
+
+    pdump('$msg_ref', $msg_ref);
+    plog(0, 0, "$victim quieted by $setby on $setat");
+}
+
 # Print events received by the IRC server in original format.
 sub irc_raw
 {
@@ -822,30 +1402,6 @@ sub irc_connected
     return;
 }
 
-# Server welcome message
-# Note that this event is necessary to start sending commands to the server.
-sub irc_001
-{
-    #my $heap   = $_[HEAP];
-    my $server = $irc->server_name;
-
-    $connected     = 1;
-    $was_connected = 1;
-    pmsg "Connected to ${server}.";
-
-    # Identify to NickServ if a password is set.
-    $irc->plugin_add('NickServID', POE::Component::IRC::Plugin::NickServID->new(
-        'Password' => $nickserv_pass,
-    )) if $nickserv_pass ne '' && $tls_cert eq '';
-
-    $irc->yield(mode  => "$nickname $usermode") if $usermode ne '';
-    $irc->yield(whois => $nickname)             if $nickserv_pass eq '';
-
-    join_channels() if $nickserv_pass eq '';
-
-    return;
-}
-
 # If a NickServ password is set, only join channels after the nick is identified,
 # so the hostname is not exposed before a cloak is set on some servers (e.g. Libera
 # Chat and OFTC).
@@ -869,12 +1425,15 @@ sub irc_whois
     my $user = $hashref->{user};
     my $host = $hashref->{host};
 
-    # ~username@hostname
-    $fullname = "${user}\@$host";
+    $userhost = "${user}\@$host";         # ~user@host
+    $fullnick = "${nickname}!$userhost";  # nick!~user@host
 
     if ($connected) {
         if ($log_path ne '') {
-            foreach my ($key, $val) ($hashref->%*) {
+            foreach my $key (sort keys $hashref->%*) {
+                my $val = $hashref->{$key};
+                $val = conv_date($val) if $key eq 'signon';
+
                 plog(1, 1, "$key => $val");
             }
         }
@@ -885,16 +1444,32 @@ sub irc_whois
     return;
 }
 
-# Log whenever pcre2bot changes its user mode and a channel mode.
+# Log whenever someone changes pcre2bot's channel modes, or pcre2bot changes its
+# user and channel modes.
+#
+# Note that irc_chan_mode and irc_user_mode can be used to parse individual mode
+# changes, but for now it is not necessary.
 sub irc_mode
 {
     my ($who, $channel, $mode) = @_[ARG0 .. ARG2];
-    my $mask = @_[ARG3 .. $#_] // '';
-    my $nick = (split /!/, $who)[0];
+    my $mask = "@_[ARG3 .. $#_]" // '';
+    my $nick = parse_user $who;
 
-    if ($nick eq $nickname && $log_path ne '') {
-        plog(1, 1, "$nick changes usermode to ${mode}.")            if $channel eq $nickname;
-        plog(1, 1, "$nick changes $channel mode to $mode ${mask}.") if $channel ne $nickname;
+    pdump('$mask', $mask);
+
+    if ($log_path ne '') {
+        # pcre2bot's nick or fullnick matches a MODE mask set by someone.
+        if ($nick ne $nickname) {
+            if ($mask eq $nickname || matches_mask($mask, $fullnick)) {
+                plog(1, 1, "$who changes $mask mode in $channel to $mode");
+            }
+        }
+
+        # pcre2bot's own MODE changes.
+        if ($nick eq $nickname) {
+            plog(1, 1, "$nick changes usermode to $mode")            if $channel eq $nickname;
+            plog(1, 1, "$nick changes $channel mode to $mode $mask") if $channel ne $nickname;
+        }
     }
 
     return;
@@ -904,9 +1479,9 @@ sub irc_mode
 sub irc_join
 {
     my ($who, $channel) = @_[ARG0, ARG1];
-    my $nick = (split /!/, $who)[0];
+    my $nick = parse_user $who;
 
-    plog(1, 1, "$nick joins ${channel}.") if $nick eq $nickname && $log_path ne '';
+    plog(1, 1, "$nick joins $channel") if $nick eq $nickname && $log_path ne '';
     return;
 }
 
@@ -915,20 +1490,20 @@ sub irc_part
 {
     my ($who, $channel) = @_[ARG0 .. ARG1];
     my $message = $_[ARG2] // '';
-    my $nick    = (split /!/, $who)[0];
+    my $nick    = parse_user $who;
 
-    plog(1, 1, "$nick leaves ${channel}: ${message}.") if $nick eq $nickname && $log_path ne '';
+    plog(1, 1, "$nick leaves ${channel}: $message") if $nick eq $nickname && $log_path ne '';
     return;
 }
 
 # Log whenever pcre2bot quits IRC (or gets KILLed).
 sub irc_quit
 {
-    my ($who, $message) = @_[ARG0, ARG1];
-    my $nick = (split /!/, $who)[0];
+    my ($who, $message, $common_channels) = @_[ARG0 .. ARG2];
+    my $nick = parse_user $who;
 
     if ($nick eq $nickname) {
-        plog(1, 1, "$nick quits IRC: ${message}.") if $log_path ne '';
+        plog(1, 1, "$nick quits IRC: $message") if $log_path ne '';
 
         # Do not reconnect bot on manual /quit.
         $irc->plugin_del('Connector');
@@ -942,18 +1517,32 @@ sub irc_kick
 {
     my ($kicker, $channel, $nick, $reason) = @_[ARG0 .. ARG3];
 
-    plog(1, 1, "$kicker kicks $nickname from ${channel}: $reason.") if $nick eq $nickname && $log_path ne '';
+    plog(1, 1, "$kicker kicks $nickname from ${channel}: $reason") if $nick eq $nickname && $log_path ne '';
     return;
 }
 
 # Update and log whenever pcre2bot changes its nick.
 sub irc_nick
 {
-    my ($who, $new_nick) = @_[ARG0, ARG1];
-    my $nick = (split /!/, $who)[0];
+    my ($who, $new_nick, $common_channels) = @_[ARG0 .. ARG2];
+    my $nick = parse_user $who;
 
-    $nickname = $new_nick if $who eq "${nickname}!$fullname";
-    plog(1, 1, "$nick changes nick to ${new_nick}.") if $log_path ne '';
+    $nickname = $new_nick if $who eq $fullnick;
+    plog(1, 1, "$nick changes nick to $new_nick") if $log_path ne '';
+
+    return;
+}
+
+# Log whenever a channel topic is set or unset by pcre2bot.
+sub irc_topic
+{
+    my ($who, $channel, $topic, $topic_old) = @_[ARG0 .. ARG3];
+    my $nick = parse_user $who;
+
+    pdump('$topic_old', $topic_old);
+    $topic_old = $topic_old->{Value};
+
+    plog(1, 1, "$nick changes topic for $channel from '${topic_old}' to '${topic}'") if $log_path ne '';
 
     return;
 }
@@ -963,7 +1552,7 @@ sub irc_ctcp
 {
     my ($type, $who, $target) = @_[ARG0 .. ARG2];
 
-    plog(1, 1, "$who sends a CTCP $type query to ${nickname}.") if $target->[0] eq $nickname && $log_path ne '';
+    plog(1, 1, "$who sends a CTCP $type query to $nickname") if $target->[0] eq $nickname && $log_path ne '';
     return;
 }
 
@@ -972,7 +1561,7 @@ sub irc_invite
 {
     my ($who, $channel) = @_[ARG0, ARG1];
 
-    plog(1, 1, "$who invites $nickname to ${channel}.") if $log_path ne '';
+    plog(1, 1, "$who invites $nickname to $channel") if $log_path ne '';
     return;
 }
 
@@ -985,6 +1574,7 @@ sub irc_shutdown
 
     $readline = '';
     delete $heap->{readwrite};
+    print "\n";  # Get rid of unterminated '> ' prompt.
 
     exit 0;
 }
@@ -1028,16 +1618,16 @@ sub irc_plugin_error
 # Reply to any PRIVMSG in channel that addresses the bot commands.
 sub irc_public
 {
-    # :ryoskzypu!~ryoskzypu@user/ryoskzypu PRIVMSG #regex :pcre2bot: help
+    # E.g. ':ryoskzypu!~ryoskzypu@user/ryoskzypu PRIVMSG #regex :pcre2bot: help'
     my ($kernel, $heap, $who, $command, $message) = @_[KERNEL, HEAP, ARG0 .. ARG2];
-    my $nick    = (split /!/, $who)[0];
-    my $name    = (split /!/, $who)[1];
-    my $channel = $command->[0];
+    my ($nick, $user, $host) = parse_user $who;
+    my $channel  = $command->[0];
 
     $heap->{channel} = $channel;
     $heap->{nick}    = "${nick}: ";
 
-    parse_privmsg($kernel, $heap, $heap->{nick}, $channel, $message) if is_name_allowed($name);
+    dump_privmsg($message);
+    parse_privmsg($kernel, $heap, $heap->{nick}, $channel, $message) if is_userhost_allowed("${user}\@$host");
 
     return;
 }
@@ -1045,29 +1635,16 @@ sub irc_public
 # Reply to any private PRIVMSG that addresses the bot commands.
 sub irc_msg
 {
-    # :ryoskzypu!~ryoskzypu@user/ryoskzypu PRIVMSG pcre2bot :pcre2bot: help
+    # E.g. ':ryoskzypu!~ryoskzypu@user/ryoskzypu PRIVMSG pcre2bot :pcre2bot: help'
     my ($kernel, $heap, $who, undef, $message) = @_[KERNEL, HEAP, ARG0 .. ARG2];
-    my $nick   = (split /!/, $who)[0];
-    my $name   = (split /!/, $who)[1];
+    my ($nick, $user, $host) = parse_user $who;
 
     $heap->{channel} = $nick;
     $heap->{nick}    = '';
 
-    parse_privmsg($kernel, $heap, '', $nick, $message) if is_name_allowed($name);
+    dump_privmsg($message);
+    parse_privmsg($kernel, $heap, '', $nick, $message) if is_userhost_allowed("${user}\@$host");
 
-    return;
-}
-
-# Log when someone is messaging pcre2bot and it has +g umode set (+g or +G on Libera
-# and +g, +G, or +j on OFTC).
-sub irc_718
-{
-    my ($server, $raw_msg, $msg_ref) = @_[ARG0 .. ARG2];
-    my $nick     = $msg_ref->[0];
-    my $fullname = $msg_ref->[1];
-    my $message  = $msg_ref->[2];
-
-    plog(1, 1, "$nick $fullname $message") if $log_path ne '';
     return;
 }
 
@@ -1796,10 +2373,11 @@ sub set_options
     };
 
     GetOptions(
-        'debug|d'   => \$debug,
-        'help|h'    => sub { print $usage; exit 0 },
-        'pass|p'    => \$pass,
-        'version|v' => sub { print "$prog ${prog_ver}\n"; exit 0 },
+        'auto-conn|ac' => \$auto_conn,
+        'debug|d'      => \$debug,
+        'help|h'       => sub { print $usage; exit 0 },
+        'pass|p'       => \$pass,
+        'version|v'    => sub { print "$prog ${prog_ver}\n"; exit 0 },
     );
 
     if ($pass) {
@@ -1827,7 +2405,7 @@ sub set_options
 # Initialize config file.
 sub init_config
 {
-    my $config_file = shift @ARGV or err 2, 'missing config file argument';
+    my $config_file = shift @ARGV or err 2, 'missing config file';
     err 2, 'config file does not exist' unless -e $config_file;
     open my $fh, '<', $config_file or err 1, "failed to open $config_file";
 
@@ -1888,9 +2466,9 @@ sub set_config_vars
     $nickserv_pass = $config->{server}->{nickserv_password} if $nickserv_pass eq '' && $tls_cert eq '';
     @channels      = ($config->{server}->{channels}->@*);
 
-    # Name lists (~username@host)
-    @names_allow  = ($config->{server}->{names_allow}->@*);
-    @names_ignore = ($config->{server}->{names_ignore}->@*);
+    # Userhost lists (~user@host)
+    @userhosts_allow  = ($config->{server}->{userhosts_allow}->@*);
+    @userhosts_ignore = ($config->{server}->{userhosts_ignore}->@*);
 
     # Default options modifiers
     $def_pat_mods  = $config->{pcre2test}->{pattern_modifiers};
@@ -1959,10 +2537,19 @@ sub init_poe
                     _default
                     _response
                     rl_handle_input
+                    got_child_stdout
+                    got_child_stderr
+                    got_child_close
+                    got_child_signal
+                    irc_001
+                    irc_329
+                    irc_333
+                    irc_367
+                    irc_718
+                    irc_728
                     irc_raw
                     irc_raw_out
                     irc_connected
-                    irc_001
                     irc_identified
                     irc_whois
                     irc_mode
@@ -1971,6 +2558,7 @@ sub init_poe
                     irc_quit
                     irc_kick
                     irc_nick
+                    irc_topic
                     irc_ctcp
                     irc_invite
                     irc_shutdown
@@ -1980,11 +2568,6 @@ sub init_poe
                     irc_plugin_error
                     irc_public
                     irc_msg
-                    irc_718
-                    got_child_stdout
-                    got_child_stderr
-                    got_child_close
-                    got_child_signal
                 >
             ],
         ],
@@ -2002,8 +2585,7 @@ sub init_poe
 }
 
 END {
-    $irc->yield(unregister => 'all');
-    print "\n";  # Get rid of unterminated '> ' prompt.
+    $irc->yield(unregister => 'all') if defined $irc;
 }
 
 # Main

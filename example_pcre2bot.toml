@@ -53,17 +53,17 @@ channels = [
     '#regex',
 ]
 
-# Name lists (~username@host)
+# Userhosts lists (~user@host)
 #
-# List of the only names that can use (allowed) or cannot use (ignored) pcre2bot.
+# List of the only userhosts that can use (allowed) or cannot use (ignored) pcre2bot.
 # Note that the 'allow' list has priority over 'ignore'.
 
 # Allowed
-names_allow = [
+userhosts_allow = [
 ]
 
 # Ignored
-names_ignore = [
+userhosts_ignore = [
 ]
 
 [pcre2test]
