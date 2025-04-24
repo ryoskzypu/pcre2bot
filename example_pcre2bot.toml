@@ -54,8 +54,8 @@ channels = [
 ]
 
 # Userhosts lists (~user@host)
-#
-# List of the only userhosts that can use (allowed) or cannot use (ignored) pcre2bot.
+
+# List of the only userhosts that can address (allowed) or cannot address (ignored) pcre2bot.
 # Note that the 'allow' list has priority over 'ignore'.
 
 # Allowed
@@ -64,6 +64,13 @@ userhosts_allow = [
 
 # Ignored
 userhosts_ignore = [
+]
+
+# Authorized
+#
+# List of userhosts that are authorized to run !commands. Note that for security
+# reasons, no one is authorized unless its userhost is on the list.
+userhosts_auth = [
 ]
 
 [pcre2test]
