@@ -1,0 +1,128 @@
+# example_pcre2bot.service — pcre2bot's systemd unit file example
+#
+# Description:
+#   Run pcre2bot daemonized as systemd user service.
+#
+# Usage:
+#   Enable and start its service:
+#     systemctl --user enable --now pcre2bot.service
+#   Get status:
+#     "                status pcre2bot
+#   Start:
+#     "                start pcre2bot
+#   Stop:
+#     "                stop pcre2bot
+#   Restart:
+#     "                restart pcre2bot
+#   Disable and stop its service:
+#     "                disable --now pcre2bot
+#   Get logs:
+#     journalctl --user-unit pcre2bot
+#
+# Notes:
+#   - Since systemd user instances are killed when the user session is closed,
+#     run 'loginctl enable-linger' to make pcre2bot service persistent.
+#
+#   - If the NICKSERV_PASS environment variable is set and pcre2bot's service is
+#     used, it is necessary to import it to systemd before starting it.
+#     E.g.
+#       export NICKSERV_PASS='password'
+#       systemctl --user import-environment NICKSERV_PASS
+#       systemctl start pcre2bot
+#
+#   - A terminal multiplexer like tmux could be used to start pcre2bot in 'ExecStart=',
+#     so its session can be reattached and the bot reused interactively.
+#
+# References:
+#   https://systemd.io/
+#   https://wiki.archlinux.org/title/Systemd#Writing_unit_files
+#   https://wiki.archlinux.org/title/Systemd/User
+#   https://man.archlinux.org/man/systemd.unit.5
+#   https://man.archlinux.org/man/systemd.service.5
+#   https://man.archlinux.org/man/systemd.exec.5
+#   https://man.archlinux.org/man/systemd.kill.5
+
+[Unit]
+Description=pcre2test IRC bot
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+
+Type=exec
+ExecStart=%h/pcre2bot/pcre2bot --auto-conn %h/pcre2bot/example_pcre2bot.toml
+
+StandardOutput=null
+StandardError=journal
+
+# Control resources.
+#
+# References:
+#   https://man.archlinux.org/man/systemd.resource-control.5
+#   https://wiki.archlinux.org/title/Cgroups
+#   https://aorith.github.io/posts/systemd-limits/
+#
+# Note that pcre2bot's CPU and memory usage is small, so it should not go beyond
+# the configured options values, unless pcre2test's output is very large and the
+# max_paste_lines value high enough to hold that.
+
+# Ensure that pcre2bot never gets more than N% CPU time on one CPU.
+CPUQuota=60%
+
+# Protect the system by limiting memory usage in case of memory leaks.
+MemoryHigh=800M
+MemoryMax=1G
+MemorySwapMax=0
+
+# Hardening
+#
+# References:
+#   https://wiki.archlinux.org/title/Systemd/Sandboxing
+#   https://man.archlinux.org/man/systemd.exec.5#SANDBOXING
+#   https://github.com/netblue30/firejail/wiki/Comparison-of-firejail-and-systemd's-hardening-options
+#   https://0pointer.net/blog/dynamic-users-with-systemd.html
+#   https://www.ctrl.blog/entry/systemd-service-hardening.html
+#   https://www.redhat.com/en/blog/mastering-systemd
+#   https://www.redhat.com/en/blog/systemd-secure-services
+#   https://www.digitalocean.com/community/tutorials/how-to-sandbox-processes-with-systemd-on-ubuntu-20-04
+#
+# Notes:
+#   - If logging is enabled and the log filepath is different than ~/pcre2bot/irclogs,
+#     it will need to be set in 'ReadWritePaths='.
+
+ProtectSystem=strict
+ProtectProc=invisible
+RestrictSUIDSGID=true
+
+# Hide /home directory while allowing ~/.config/environment.d (drop-in dir used
+# to export env vars to systemd user instances) and ~/perl5 (perlbrew's dir)
+# directories to be readable; also ~/pcre2bot read-writeable.
+#
+# Notes:
+#   - This allows the user to export perlbrew's bin PATH, so pcre2bot can access
+#     perlbrew's perl + cpanm modules. Also pcre2bot's dir will be persistent and
+#     able to write to its logs.
+#   - Because of sandboxing, any log dirs in ~/pcre2bot (e.g. irclogs), must be
+#     created before starting the service.
+ProtectHome=tmpfs
+TemporaryFileSystem=%h/
+BindReadOnlyPaths=%h/.config/environment.d/ %h/perl5/
+BindPaths=%h/pcre2bot/
+
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+PrivateUsers=true
+
+CapabilityBoundingSet=
+NoNewPrivileges=true
+RestrictNamespaces=~user pid net uts mnt cgroup ipc
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Add firejail's default seccomp filter.
+# See https://raw.githubusercontent.com/netblue30/firejail/refs/heads/master/etc/templates/syscalls.txt.
+SystemCallFilter=~@clock @cpu-emulation @debug @module @mount @obsolete @raw-io @reboot @swap open_by_handle_at name_to_handle_at ioprio_set ni_syscall syslog fanotify_init add_key request_key mbind migrate_pages move_pages keyctl io_setup io_destroy io_getevents io_submit io_cancel remap_file_pages set_mempolicyvmsplice userfaultfd acct bpf nfsservctl setdomainname sethostname vhangup ptrace personality process_vm_readv
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=default.target

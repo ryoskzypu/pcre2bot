@@ -1,0 +1,82 @@
+Commands:
+  For the complete description of PoCo-IRC commands, see https://metacpan.org/pod/POE::Component::IRC#INPUT-EVENTS,
+  and https://en.wikipedia.org/wiki/List_of_Internet_Relay_Chat_commands.
+
+  /admin      [server]                                          query server's admin info
+  /away       [message]                                         set or remove away status
+  /cap        end | ls | list | ack cap... | req cap...         query/enable/disable IRC protocol capabilities
+  /connect                                                      connect to the server from config file
+  /ctcp       #channel,... message                              send a CTCP query to channels or nicks
+  /ctcpreply  #channel,... message                              "           reply "
+  /dcc        nick send file [blksize] [timeout] | nick chat    send a DCC SEND or CHAT request to a nick
+  /dcc_accept cookie [file]                                     accept an incoming DCC connection from another host
+  /dcc_chat   id data                                           send lines of data to a nick
+  /dcc_close  id                                                terminate a DCC SEND or GET connection, and close DCC CHAT connections
+  /dcc_resume cookie [file]                                     resume a DCC SEND file transfer
+  /debug      [1 | 0]                                           turn POE's debugging mode on or off
+  /die                                                          tell server to shutdown
+  /info       [server]                                          query server's info
+  /invite     nick #channel                                     invite nick to a channel
+  /ison       nick...                                           check if nicks are currently online
+  /join       #channel [key]                                    join a channel
+  /kick       #channel nick [message]                           kick a user from channel
+  /links      [[server] mask]                                   query list of servers connected to the IRC network
+  /list       [#channel...]                                     list visible channels and their topics
+  /locops     message                                           send a message to all local-opers (+l) on EFNet
+  /mode       #channel mode [mask]                              change a channel or nick mode
+  /motd                                                         query server's 'Message of the Day'
+  /names      #channel...                                       list nicks from channels
+  /nick       nick                                              change current nick
+  /nickserv   ...                                               send a message to NickServ
+  /notice     #channel,... message                              send a notice message to channels or nicks
+  /oper       user password                                     get server's operator privileges
+  /operwall   message                                           send a message to all global opers on EFNet
+  /part       #channel,... message                              leave channels
+  /ping       server                                            send a ping to server
+  /pong       server                                            answer a ping message
+  /privmsg    #channel,... message                              send a message to channels or nicks
+  /quit       [message]                                         disconnect from server
+  /quote      string                                            send a raw string to server
+  /register   event,...                                         register events to POE's session
+  /rehash                                                       tell server to reload its config file
+  /remove     #channel nick [message]                           force a nick to leave a channel
+  /restart                                                      tell server to restart itself
+  /sconnect   server [port] [remote]                            tell a server to connect to another
+  /servlist   [mask [type]]                                     list services currently connected to the network
+  /shutdown   [message [timeout]]                               disconnect from server and shutdown POE's session
+  /squery     #channel,... message                              send a message to a service
+  /squit      server message                                    disconnect server links
+  /stats      [query [server]]                                  query statistics about server
+  /summon     user [server [#channel]]                          give users from server a message asking them to please join IRC
+  /time       [server]                                          query local time from server
+  /topic      #channel [string]                                 get or set a channel's topic
+  /trace      [server]                                          find the route to a server or nick
+  /unregister event,...                                         unregister events from POE's session
+  /userhost   nick...                                           query info about nicks
+  /users      [server]                                          query count of users who are logged-in to a server
+  /version    [server]                                          query server's version info
+  /wallops    message                                           send a message to all opers (and +w users)
+  /who        [name [o]]                                        query list of users that match a name
+  /whois      [nick...]                                         query info about nicks or hostmasks
+  /whowas     nick [count [server]]                             query info about offline nick
+
+New commands:
+  /ban        #channel [nick...]              ban nicks or hosts
+  /cycle      #channel,... [message]          leave and rejoin channels
+  /dehalfop   #channel nick...                remove channel half-operator status from nicks
+  /deop       #channel nick...                "              operator      "
+  /devoice    #channel nick...                "              voice         "
+  /dumpstate                                  dump current IRC state info
+  /halfop     #channel nick...                give channel half-operator status to nicks
+  /help                                       show /commands usage
+  /kickban    #channel nick [reason]          kick a user from channel and ban its host
+  /me         #channel,... message            send a CTCP action to channels or nicks
+  /msg        #channel,... message            alias of /privmsg
+  /op         #channel nick...                give channel operator status to nicks
+  /quiet      #channel [nick...]              quiet nicks or hosts
+  /reconnect                                  reconnect to the current connected server
+  /run        -a | -c=#channel,... command    run a command on all joined channels or specific channels
+  /unban      #channel nick...                unban nicks or hosts
+  /unquiet    #channel nick...                unquiet "
+  /voice      #channel nick...                give channel voice status to nicks
+  /whox       [name [o]]                      extended query list of users that match a name
