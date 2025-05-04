@@ -89,6 +89,9 @@
 #   - Study POE, and POE::Component::IRC, Mojo::IRC, AnyEvent::IRC.
 #   - Study perlbot, shbot, and greybot to get ideias of useful features to implement.
 #
+#   - Add a log rotation to the logs with logrotate, document it, and provide
+#     an example config.
+#
 #   - Study on how to implement perl modules/packages to the script, because it's
 #     too long.
 #
@@ -101,13 +104,6 @@
 #     'nc' can be used.
 #   - Add bash tab completions.
 #   - Create a makefile to install all files, or use ExtUtils::MakeMaker.
-#
-#   - Think of ways of securing the bot e.g. sandboxing using virtualization,
-#     linux namespaces, containers, etc.
-#     Add a firejail profile.
-#
-#   - Add a log rotation to the logs with logrotate, document it, and provide
-#     an example config.
 #
 #   - Study ways of how the bot can be deployed in a server.
 #   - After POE script is done, maybe try to reimplement it with another framework,
@@ -129,8 +125,9 @@ use Getopt::Long          qw< GetOptions :config gnu_getopt >;
 use TOML::Tiny            qw< from_toml >;
 use POE                   qw<
                               Wheel::Run
-                              Wheel::ReadWrite
                               Wheel::ReadLine
+                              Wheel::SocketFactory
+                              Wheel::ReadWrite
                               Component::IRC
                               Component::IRC::State
                               Component::IRC::Plugin::NickServID
@@ -140,6 +137,7 @@ use POE                   qw<
                              #Component::Curl::Multi  # PoCo-Curl is failing to build for latest libcurl because of Net::Curl header issue, re-add it when upstream fix it.
 use IRC::Utils            qw< parse_user matches_mask >;
 use HTTP::Request::Common qw< POST >;
+use Socket                qw< PF_UNIX >;
 use Data::Dumper          qw< Dumper >;
 use POSIX                 qw< strftime >;
 
@@ -198,7 +196,8 @@ my $usage = <<~"END";
           --ac, --auto-conn auto-connect to server on start
       -d, --debug           show debug info
       -h, --help            show this help and exit
-      -p, --pass            accepts STDIN as NickServ password
+      -p, --pass            accept STDIN as NickServ password
+      -u, --unix            start a Unix socket server that accept /commands
       -v, --version         show version info and exit
 
     Examples:
@@ -371,9 +370,10 @@ my @commands = (
 );
 
 # Options
-my $auto_conn = 0;
-my $debug     = 0;
-my $pass      = 0;
+my $auto_conn   = 0;
+my $debug       = 0;
+my $pass        = 0;
+my $unix_server = 0;
 
 # Configuration
 my $config;
@@ -438,7 +438,7 @@ my $no_service    = 0;                                # Primary pastebin service
 
 # Utils
 
-# Handle pcre2bot errors
+# Handle pcre2bot errors.
 sub err
 {
     my ($code, $msg) = @_;
@@ -449,7 +449,7 @@ sub err
     exit $code;
 }
 
-# Auto-join channels
+# Auto-join channels.
 sub join_channels { $irc->yield(join => $_) foreach @channels }
 
 # Print debug message.
@@ -538,7 +538,7 @@ sub perr
 {
     my ($channel, $nick, $message) = @_;
 
-    $channel eq '' ? pput(1, $message)
+    $channel eq '' ? plog(1, 0, 0, 0, $message)
                    : $irc->yield(privmsg => $channel => "${nick}${message}");
 }
 
@@ -624,27 +624,49 @@ sub is_userhost_allowed
     }
 }
 
+# Validate a /command.
+sub check_command
+{
+    my ($input) = @_;
+    my $command = '';
+
+    ($command) = $input =~ /\A([^\h]*+)\h*+/;
+
+    if (! grep { $_ =~ /\A\Q$command\E\z/ } map { (split / /, $_)[0] } @commands) {
+        return 0;
+    }
+
+    return 1;
+}
+
 # Request a mode change on a specific channel.
 sub set_chan_mode
 {
     my ($privmsg_chan, $privmsg_nick, $args, $action, $mode, $err) = @_;
     my $channel  = shift $args->@*;
     my $args_len = scalar $args->@*;
+    my $rc;
 
     if (! defined $channel) {
-        perr($privmsg_chan, $privmsg_nick, "missing channel");
-        return;
+        $rc = 'missing channel';
+
+        perr($privmsg_chan, $privmsg_nick, $rc);
+        return $rc;
     }
 
     if (! $args->@*) {
-        perr($privmsg_chan, $privmsg_nick, "missing $err");
-        return;
+        $rc = "missing $err";
+
+        perr($privmsg_chan, $privmsg_nick, $rc);
+        return $rc;
     }
 
     $action .= $mode x $args_len;
 
     # Set mode
     $irc->yield(mode => "$channel $action " . join ' ', $args->@*);
+
+    return 'OK';
 }
 
 # Event handlers
@@ -698,6 +720,31 @@ sub _start
         };
     }
 
+    # Create a Unix socket server at a particular socket to receive /commands.
+    #
+    # References:
+    #   https://metacpan.org/pod/perlipc#Unix-Domain-TCP-Clients-and-Servers
+    #   https://perldoc.perl.org/Socket
+    #   https://perldoc.perl.org/IO::Socket
+    #   https://perldoc.perl.org/IO::Socket::UNIX
+    #   https://metacpan.org/pod/POE::Wheel::SocketFactory
+    #   http://poe.perl.org/?POE_Cookbook/UNIX_Servers
+    #   http://poe.perl.org/?POE_Cookbook/UNIX_Clients
+    if ($unix_server) {
+        # Unix socket filepath
+        my $rendezvous = "/tmp/pcre2bot/pcre2bot-unix-socket";
+
+        # Remove the socket if it exists before creating the server.
+        unlink $rendezvous if -e $rendezvous;
+
+        $heap->{unix_server} = POE::Wheel::SocketFactory->new(
+            SocketDomain => PF_UNIX,
+            BindAddress  => $rendezvous,
+            SuccessEvent => 'unix_server_accepted',
+            FailureEvent => 'unix_server_error',
+        );
+    }
+
     $irc->yield(register => 'all');
     $irc->yield(connect  => {}) if $auto_conn;
 
@@ -710,6 +757,7 @@ sub _default
     return unless $debug;
 
     my ($event, $args) = @_[ARG0 .. $#_];
+    $event = '' unless defined $event;
 
     # Ignore events that are already handled by irc_raw* subroutines.
     if ($event =~ /
@@ -748,7 +796,7 @@ sub _default
     }
 
     plog(1, 0, 0, 0, "@output");
-    return;
+    return 0;
 }
 
 # Handle PoCo-Curl's HTTP requests responses.
@@ -800,7 +848,7 @@ sub rw_handle_input
 # Note that for some reason this handler shows a 'Bad file descriptor' error event.
 sub rw_error_state
 {
-    my ($operation, $errnum, $errstr, $id) = @_[ARG0..ARG3];
+    my ($operation, $errnum, $errstr, $id) = @_[ARG0 .. ARG3];
 
     if ($operation eq 'read' and $errnum == 0) {
         pdbg("EOF from wheel $id");
@@ -862,11 +910,45 @@ sub parse_command
 {
     my ($privmsg_chan, $privmsg_nick, $input) = @_;
 
-    if ($input =~ s|\A/||) {
+    pdbg("\$input: '${input}'");
+
+    # Validate /command
+    if (! check_command($input)) {
+        my $err = "invalid '${input}' command";
+
+        perr($privmsg_chan, $privmsg_nick, $err);
+        return $err;
+    }
+
+    if ($input =~ s|\A/(?=[^\n]++)||) {  # Strip leading slash to simplify matches.
         my (@args) = split / /, $input;
         my ($cmd)  = shift @args;
 
         pdump('@args', \@args);
+
+        # To avoid exception errors, check if pcre2bot is connected to an IRC server
+        # before running commands that require it to be connected.
+        if ($cmd !~ /
+                           \A
+                           (?>
+                               connect
+                               | debug
+                               | dumpstate
+                               | help
+                               | reconnect
+                               | register
+                               | shutdown
+                               | unregister
+                           )
+                           \z
+                       /x) {
+            if (! $irc->connected) {
+                my $err = "command '${cmd}' requires an IRC connection";
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
+            }
+        }
 
         # Commands that take 1 argument and a string.
         if ($cmd =~ /
@@ -916,8 +998,10 @@ sub parse_command
         }
         elsif ($cmd eq 'connect') {
             if ($irc->connected) {
-                perr($privmsg_chan, $privmsg_nick, "already connected to $server");
-                return;
+                my $err = "already connected to $server";
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
             else {
                 pput(1, "connecting to $server on port $port");
@@ -957,8 +1041,10 @@ sub parse_command
             my @victim_list;
 
             if (! defined $channel) {
-                perr($privmsg_chan, $privmsg_nick, "missing channel");
-                return;
+                my $err = 'missing channel';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             # Set mode's action.
@@ -977,7 +1063,10 @@ sub parse_command
 
             if (! @args) {
                 if ($action eq '-') {
-                    perr($privmsg_chan, $privmsg_nick, "missing nick or host");
+                    my $err = 'missing nick or host';
+
+                    perr($privmsg_chan, $privmsg_nick, $err);
+                    return $err;
                 }
                 # Show channel's ban/quiet list.
                 elsif ($action eq '+') {
@@ -987,9 +1076,8 @@ sub parse_command
                     elsif (defined $+{quiet}) {
                         $irc->yield(mode => "$channel $type");
                     }
+                    return 'OK';
                 }
-
-                return;
             }
 
             $action .= $type x $args_len;
@@ -1020,8 +1108,10 @@ sub parse_command
             my $args_len = scalar @args;
 
             if (! @args) {
-                perr($privmsg_chan, $privmsg_nick, "missing channels");
-                return;
+                my $err = 'missing channels';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             # Get /part message if any.
@@ -1036,17 +1126,20 @@ sub parse_command
         # Remove channel half-operator status from nicks
         #   /dehalfop #channel nick...
         elsif ($cmd eq 'dehalfop') {
-            set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '-', 'h', 'nicks');
+            my $rc = set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '-', 'h', 'nicks');
+            return $rc;
         }
         # Remove channel operator status from nicks
         #   /deop #channel nick...
         elsif ($cmd eq 'deop') {
-            set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '-', 'o', 'nicks');
+            my $rc = set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '-', 'o', 'nicks');
+            return $rc;
         }
         # Remove channel voice status from nicks.
         #   /devoice #channel nick...
         elsif ($cmd eq 'devoice') {
-            set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '-', 'v', 'nicks');
+            my $rc = set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '-', 'v', 'nicks');
+            return $rc;
         }
         # Dump IRC state info.
         elsif ($cmd eq 'dumpstate') {
@@ -1055,10 +1148,12 @@ sub parse_command
         # Give channel half-operator status to nicks.
         #   /halfop #channel nick...
         elsif ($cmd eq 'halfop') {
-            set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '+', 'h', 'nicks');
+            my $rc = set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '+', 'h', 'nicks');
+            return $rc;
         }
         elsif ($cmd eq 'help') {
-            pput(1, $commands);
+            pput(1, $_) foreach (split /\n/, $commands);
+            return $commands;
         }
         # Kick a user from channel and ban its host.
         #   /kickban #channel nick [reason]
@@ -1069,13 +1164,17 @@ sub parse_command
             my $channel = shift @args;
 
             if (! defined $channel) {
-                perr($privmsg_chan, $privmsg_nick, "missing channel");
-                return;
+                my $err = 'missing channel';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             if (! @args) {
-                perr($privmsg_chan, $privmsg_nick, "missing nick");
-                return;
+                my $err = 'missing nick';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             my $nick      = shift @args;
@@ -1108,8 +1207,10 @@ sub parse_command
             my $channels = shift @args;
 
             if (! defined $channels) {
-                perr($privmsg_chan, $privmsg_nick, "missing channels or nicks");
-                return;
+                my $err = 'missing channels or nicks';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             $irc->yield(ctcp => $channels => 'ACTION ' . "@args");
@@ -1122,7 +1223,8 @@ sub parse_command
         # Give channel half-operator status to nick.
         #   /op #channel nick...
         elsif ($cmd eq 'op') {
-            set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '+', 'o', 'nicks');
+            my $rc = set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '+', 'o', 'nicks');
+            return $rc;
         }
         # Send a public/private message to specific channels or nicks.
         #   /privmsg #channel,... message
@@ -1137,8 +1239,10 @@ sub parse_command
             my $channels = shift @args;
 
             if (! defined $channels) {
-                perr($privmsg_chan, $privmsg_nick, "missing channels or nicks");
-                return;
+                my $err = 'missing channels or nicks';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             $irc->yield(privmsg => $channels => "@args")
@@ -1152,8 +1256,10 @@ sub parse_command
                 $irc->delay(['connect'], 5);
             }
             else {
-                pput(1, "not connected to a server");
-                return;
+                my $err = 'not connected to a server';
+
+                pput(1, $err);
+                return $err;
             }
         }
         # Run a command on all joined channels or specific channels.
@@ -1182,32 +1288,42 @@ sub parse_command
                     pdump('@channels', \@channels);
 
                     if (! @channels) {
-                        perr($privmsg_chan, $privmsg_nick, "missing channels");
-                        return;
+                        my $err = 'missing channels';
+
+                        perr($privmsg_chan, $privmsg_nick, $err);
+                        return $err;
                     }
                 }
                 else {
-                    perr($privmsg_chan, $privmsg_nick, "invalid '${option}' option");
-                    return;
+                    my $err = "invalid '${option}' option";
+
+                    perr($privmsg_chan, $privmsg_nick, $err);
+                    return $err;
                 }
             }
 
             if (! defined $cmdname) {
-                perr($privmsg_chan, $privmsg_nick, "missing command argument");
-                return;
+                my $err = 'missing command argument';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             # Do not accept 'run' command to avoid infinite recursion.
             if (defined $cmdname && $cmdname eq '/run') {
-                perr($privmsg_chan, $privmsg_nick, "/run command is not valid");
-                return;
+                my $err = '/run command is not valid';
+
+                perr($privmsg_chan, $privmsg_nick, $err);
+                return $err;
             }
 
             # Run
             if ($all) {
                 if (! $irc->channels->%*) {
-                    perr($privmsg_chan, $privmsg_nick, "pcre2bot has not joined in any channel");
-                    return;
+                    my $err = 'pcre2bot has not joined in any channel';
+
+                    perr($privmsg_chan, $privmsg_nick, $err);
+                    return $err;
                 }
 
                 pdump('$irc->channels', $irc->channels);
@@ -1248,7 +1364,8 @@ sub parse_command
         # Give channel voice status to nicks.
         #   /voice #channel nick...
         elsif ($cmd eq 'voice') {
-            set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '+', 'v', 'nicks');
+            my $rc = set_chan_mode($privmsg_chan, $privmsg_nick, \@args, '+', 'v', 'nicks');
+            return $rc;
         }
         # Without argument, request a WHOIS on pcre2bot's nick.
         elsif ($cmd eq 'whois') {
@@ -1269,7 +1386,7 @@ sub parse_command
         }
     }
 
-    return;
+    return 'OK';
 }
 
 # Handle pcre2test's STDOUT events.
@@ -1375,7 +1492,7 @@ sub got_child_stderr
     my $child     = $heap->{children_by_wid}{$wheel_id};
     my $child_pid = $child->PID;
 
-    $child->shutdown_stdin;
+    $child->shutdown_stdin if $stderr_line eq '';
 
     pdbg("PID $child_pid STDERR: $stderr_line");
 }
@@ -1422,6 +1539,59 @@ sub got_child_signal
     delete $heap->{nick};
     delete $heap->{trigger};
     delete $heap->{input};
+}
+
+# Handle successful client connections from Unix socket server.
+sub unix_server_accepted
+{
+    my ($heap, $socket) = @_[HEAP, ARG0];
+
+    # Handle IO from socket in a non-blocking way.
+    my $readwrite_unix = POE::Wheel::ReadWrite->new(
+        Handle     => $socket,
+        InputEvent => 'unix_client_input',
+        ErrorEvent => 'unix_client_error',
+    );
+
+    my $rw_unix_id = $readwrite_unix->ID;
+
+    $heap->{unix_client}{$rw_unix_id} = $readwrite_unix;
+    $heap->{unix_client}{$rw_unix_id}->put(
+        "Welcome to pcre2bot's Unix socket server.",
+        'Only /commands are accepted. See /help for usage.'
+    );
+}
+
+# Handle Unix socket server errors.
+sub unix_server_error
+{
+    my ($heap, $syscall, $errno, $error) = @_[HEAP, ARG0 .. ARG2];
+    $error = 'Normal disconnection' unless $errno;
+
+    pmsg(2, 0, "Unix socket server encountered $syscall error $errno: $error");
+    delete $heap->{unix_server};
+}
+
+# Handle client inputs from Unix socket server.
+sub unix_client_input
+{
+    my ($heap, $input, $wheel_id) = @_[HEAP, ARG0, ARG1];
+
+    plog(1, 0, 0, 0, "Received client data: $input");
+
+    # /command
+    my $rc = parse_command('', '', $input);
+    $heap->{unix_client}{$wheel_id}->put($rc);
+}
+
+# Handle Unix client socket errors.
+sub unix_client_error
+{
+    my ($heap, $syscall, $errno, $error, $wheel_id) = @_[HEAP, ARG0 .. ARG3];
+    $error = 'Normal disconnection' unless $errno;
+
+    pmsg(2, 0, "Unix client socket encountered $syscall error $errno: $error");
+    delete $heap->{unix_client}{$wheel_id};
 }
 
 # Events
@@ -1687,7 +1857,7 @@ sub irc_join
 # Log whenever pcre2bot leaves a channel.
 sub irc_part
 {
-    my ($who, $channel) = @_[ARG0 .. ARG1];
+    my ($who, $channel) = @_[ARG0, ARG1];
     my $message = $_[ARG2] // '';
     my $nick    = parse_user $who;
 
@@ -1774,6 +1944,8 @@ sub irc_shutdown
     $readline = '';
     delete $heap->{readwrite_main};
     delete $heap->{readwrite_raw};
+    delete $heap->{unix_server};
+    delete $heap->{unix_client};
     print "\n";  # Get rid of unterminated '> ' prompt.
 
     exit 0;
@@ -1972,7 +2144,8 @@ sub parse_privmsg
         }
         # !command
         elsif (defined $+{in_cmd}) {
-            my $target = ($nick eq '' ? 'private' : $channel);
+            my $target    = ($nick eq '' ? 'private' : $channel);
+            my $help_link = 'https://raw.githubusercontent.com/ryoskzypu/pcre2bot/main/help_commands';
 
             if (! @userhosts_auth || ! grep { $_ eq $userhost } @userhosts_auth) {
                 # Ignore and report if a user is not authorized.
@@ -1980,14 +2153,12 @@ sub parse_privmsg
                 return;
             }
 
-            my $fullcmd = $+{in_cmd};
+            my $cmd = $+{in_cmd};
 
-            if ($fullcmd =~ s|\A!|/|) {
+            if ($cmd =~ s|\A!(?=[^\n]++)|/|) {  # Replace !command with /command
                 # Get and validate /command before ReadLine's parsing.
 
-                my ($cmd) = $fullcmd =~ /\A([^\h]*+)\h*+/;
-
-                if (! grep { $_ =~ /\A\Q$cmd\E/ } @commands) {
+                if (! check_command($cmd)) {
                     $irc->yield(privmsg => $channel => "${nick}invalid '${cmd}' command");
                     return;
                 }
@@ -1995,14 +2166,13 @@ sub parse_privmsg
                 pmsg(1, 0, "Authorized '${userhost}' runs '${cmd}' in ${target}: '${message}'");
 
                 # Show a webpage link for the !help command to avoid flood ban,
-                # because the output is huge. Maybe a link to a help file from
-                # pcre2bot's repo.
+                # because the output is huge.
                 if ($cmd =~ m{\A/help\h*+}) {
-                    $irc->yield(privmsg => $channel => "${nick}<help link>");
+                    $irc->yield(privmsg => $channel => "${nick}$help_link");
                     return;
                 }
 
-                parse_command($channel, $nick, $fullcmd);
+                parse_command($channel, $nick, $cmd);
             }
         }
     }
@@ -2606,6 +2776,42 @@ sub get_pastebin
     return;
 }
 
+# Test sandbox from pcre2bot's systemd unit file or firejail profile.
+#
+# Notes:
+#   - The --debug option is required.
+#   - Run 'systemd-analyze --user security pcre2bot' to get an overview of systemd's
+#     pcre2bot sandbox.
+#   - If firejail is used, jailcheck can also test the sandbox. See jailcheck(1).
+sub test_sandbox
+{
+    return if ! $debug;
+
+    plog(2, 0, 0, 0, "Testing pcre2bot's sandbox.");
+
+    # Check if $HOME is properly whitelisted, i.e. pcre2bot can only access its
+    # directory in ${HOME}/pcre2bot and ${HOME}/perl5.
+
+    my $home     = $ENV{HOME};
+    my @dirnames = (
+        $home,
+        '/tmp',
+    );
+
+    foreach my $dir (@dirnames) {
+        opendir my $dh , $dir or err 1, "failed to open '${dir}' directory";
+        my @files = readdir $dh;
+        closedir $dh;
+
+        plog(2, 0, 0, 0, "Listing '${dir}' files:");
+
+        foreach my $i (@files) {
+            next if $i =~ /\A\.{1,2}+\z/;
+            plog(2, 0, 0, 0, "  '${i}'");
+        }
+    }
+}
+
 sub set_dumper
 {
     $Data::Dumper::Terse = 1;
@@ -2643,12 +2849,13 @@ sub set_options
         'debug|d'      => \$debug,
         'help|h'       => sub { print $usage; exit 0 },
         'pass|p'       => \$pass,
+        'unix|u'       => \$unix_server,
         'version|v'    => sub { print "$prog ${prog_ver}\n"; exit 0 },
     );
 
     if ($pass) {
         # Non-interactive STDIN
-        if (! -t STDIN) {
+        if (! $interactive) {
             chomp ($nickserv_pass = <STDIN>);
         }
         # STDIN is opened to a TTY.
@@ -2819,6 +3026,10 @@ sub init_poe
                     got_child_stderr
                     got_child_close
                     got_child_signal
+                    unix_server_accepted
+                    unix_server_error
+                    unix_client_input
+                    unix_client_error
                     irc_001
                     irc_329
                     irc_333
@@ -2877,4 +3088,5 @@ set_config_vars();
 check_log();
 check_pcre2test();
 init_poe();
+test_sandbox();
 $poe_kernel->run();

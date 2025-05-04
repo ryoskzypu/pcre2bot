@@ -7,5 +7,8 @@
 # Ignore pcre2bot.toml config file that is currently used.
 /pcre2bot.toml
 
-# Ignore pcre2bot.service unit file "
+# Ignore pcre2bot.service systemd unit file "
 /pcre2bot.service
+
+# Ignore pcre2bot.profile firejail profile "
+/pcre2bot.profile

@@ -1,0 +1,381 @@
+#!/usr/bin/env perl
+#
+# unixclt — pcre2bot's Unix socket client
+#
+# Description:
+#   Connect to pcre2bot's Unix socket server and send /commands.
+#
+# Usage:
+#   Just run the script in a TTY and enter /commands interactively, or pipe /commands
+#   to it non-interactively.
+#   See /help for commands info.
+#
+#   Note that pcre2bot must be running with the --unix option, so it can create
+#   the server and receive /commands.
+#
+# References:
+#   https://metacpan.org/pod/perlipc#Unix-Domain-TCP-Clients-and-Servers
+#   https://perldoc.perl.org/Socket
+#   https://perldoc.perl.org/IO::Socket
+#   https://perldoc.perl.org/IO::Socket::UNIX
+#   https://metacpan.org/pod/POE::Wheel::SocketFactory
+#   http://poe.perl.org/?POE_Cookbook/UNIX_Servers
+#   http://poe.perl.org/?POE_Cookbook/UNIX_Clients
+#
+# TODO:
+#   - Create a module to store the completions, to avoid repetition.
+
+use strict;
+use warnings;
+
+use File::Basename;
+use Getopt::Long qw< GetOptions :config gnu_getopt >;
+use Socket       qw< AF_UNIX >;
+use POE          qw<
+                     Wheel::SocketFactory
+                     Wheel::ReadWrite
+                     Wheel::ReadLine
+                 >;
+
+# Global variables
+
+$|++;  # Disable STDOUT buffering.
+
+my $prog     = basename $0;
+my $prog_ver = '0.1';
+
+# Wheter script is running interactively, i.e. connected to a TTY.
+my $interactive = (-t STDIN && -t STDOUT ? 1 : 0);
+
+# The Unix socket filepath where the client connects to, and the server listens to.
+my $rendezvous = '/tmp/pcre2bot/pcre2bot-unix-socket';
+
+my $readline;  # POE's ReadLine
+
+# Handle warnings.
+local $SIG{__WARN__} = sub {
+    my ($msg) = @_;
+
+    # Format warnings when POE's ReadLine is set, so they are shown correctly.
+    if (defined $readline) {
+        $msg =~ s/\n\z//;
+        $readline->put($msg);
+    } else {
+        warn $msg;
+    }
+};
+
+my $usage = <<~"END";
+    Usage: $prog [OPTION]...
+    pcre2bot's Unix socket client
+    Connect to pcre2bot's Unix socket server and send /commands.
+
+    Options:
+      -h, --help    show this help and exit
+      -v, --version show version info and exit
+
+    Examples:
+      run unixclt interactively:
+        $prog
+
+      run unixclt non-interactively:
+        printf '%s\\n' /connect '/msg #pcre2bot hi' | $prog
+    END
+
+# pcre2bot's input /commands
+my @commands = (
+    '/admin ',
+    '/away ',
+    '/ban ',
+    '/cap ',
+    '/connect ',
+    '/ctcp ',
+    '/ctcpreply ',
+    '/cycle ',
+    '/dehalfop ',
+    '/deop ',
+    '/devoice ',
+    '/dcc ',
+    '/dcc_accept ',
+    '/dcc_chat ',
+    '/dcc_close ',
+    '/dcc_resume ',
+    '/debug ',
+    '/dumpstate',
+    '/die',
+    '/halfop ',
+    '/help',
+    '/info ',
+    '/invite ',
+    '/ison ',
+    '/join ',
+    '/kickban ',
+    '/kick ',
+    '/links ',
+    '/list ',
+    '/locops ',
+    '/mode ',
+    '/motd',
+    '/me ',
+    '/msg ',
+    '/names ',
+    '/nick ',
+    '/nickserv ',
+    '/notice ',
+    '/oper ',
+    '/op ',
+    '/operwall ',
+    '/part ',
+    '/ping ',
+    '/pong ',
+    '/privmsg ',
+    '/quiet ',
+    '/quit ',
+    '/quote ',
+    '/register ',
+    '/rehash',
+    '/remove ',
+    '/reconnect',
+    '/restart',
+    '/run ',
+    '/sconnect ',
+    '/servlist ',
+    '/shutdown ',
+    '/squery ',
+    '/squit ',
+    '/stats ',
+    '/summon ',
+    '/time ',
+    '/topic ',
+    '/trace ',
+    '/unban ',
+    '/unquiet ',
+    '/unregister ',
+    '/userhost ',
+    '/users ',
+    '/version ',
+    '/voice ',
+    '/wallops ',
+    '/who ',
+    '/whois ',
+    '/whowas ',
+    '/whox ',
+);
+
+# Utils
+
+# Handle pcre2bot errors.
+sub err
+{
+    my ($code, $msg) = @_;
+
+    print STDERR "${prog}: ${msg}\n";
+
+    $readline = '';
+    exit $code;
+}
+
+# Event handlers
+
+sub _start
+{
+    my $heap = $_[HEAP];
+
+    # Create the SocketFactory object that will connect a Unix socket to the server.
+    $heap->{unix_socket} = POE::Wheel::SocketFactory->new(
+        SocketDomain  => AF_UNIX,
+        RemoteAddress => $rendezvous,
+        SuccessEvent  => 'socket_connected',
+        FailureEvent  => 'socket_error',
+    );
+}
+
+# Handle successful socket connections to the Unix socket server.
+sub socket_connected
+{
+    my ($heap, $socket) = @_[HEAP, ARG0];
+
+    delete $heap->{unix_socket};
+
+    # Create a ReadWrite object that will talk with the Unix socket.
+    $heap->{readwrite} = POE::Wheel::ReadWrite->new(
+        Handle       => $socket,
+        InputEvent   => 'socket_input',
+        ErrorEvent   => 'socket_error',
+    );
+
+    # unixclt is not running interactively, i.e. some data was sent to its STDIN.
+    if (! $interactive) {
+        # Create a FlushedEvent object on the Unix socket, to know when the socket
+        # is done, so POE objects can be cleaned and the script 'exit' (not hang/wait for STDIN).
+        $heap->{readwrite}->event(FlushedEvent => 'socket_flushed');
+
+        # Create a ReadWrite object that will accept non-interactive user inputs.
+        $heap->{notty} = POE::Wheel::ReadWrite->new(
+            InputHandle  => \*STDIN,
+            OutputHandle => \*STDOUT,
+            InputEvent   => 'notty_input',
+            ErrorEvent   => 'notty_error',
+        );
+    }
+    else {
+        # Create a ReadLine object that will talk with the TTY.
+        $readline = POE::Wheel::ReadLine->new(InputEvent => 'tty_input');
+
+        # Add tab completions to pcre2bot's /commands.
+        my $attribs = $readline->attribs;
+        $attribs->{completion_function} = sub {
+            my ($text, $line, $start) = @_;
+
+            return @commands;
+        };
+
+        # Prompt for input.
+        $readline->get('> ');
+    }
+}
+
+# Handle socket error events from Unix socket server.
+sub socket_error
+{
+    my ($heap, $syscall, $errno, $error, $wheel_id) = @_[HEAP, ARG0 .. ARG3];
+    $error = 'Normal disconnection' unless $errno;
+
+    warn "Client socket encountered $syscall error $errno: $error";
+
+    # Cleaning
+    delete $heap->{unix_socket};
+    delete $heap->{readwrite};
+    delete $heap->{notty};
+    $readline = '';
+
+    print "\n" if $readline;  # Get rid of unterminated '> ' prompt.
+}
+
+# Handle input events from Unix socket server.
+sub socket_input
+{
+    my ($heap, $input, $wheel_id) = @_[HEAP, ARG0, ARG1];
+    my $reply = "server: $input";
+
+    # Send server's reply to the TTY.
+    defined $readline ? $readline->put($reply)
+                      : print "${reply}\n";
+
+    # Socket is done, clean all POE objects and close handles.
+    if ($heap->{flushed}) {
+        # Cleaning
+        delete $heap->{flushed};
+        delete $heap->{unix_socket};
+        delete $heap->{readwrite};
+        delete $heap->{notty};
+    }
+}
+
+# Handle flushed events from Unix socket server.
+#
+# Note that a FlushedEvent happens whenever the output buffer from Unix server
+# transitions from containing data to becoming empty.
+sub socket_flushed
+{
+    my ($heap, $wheel_id) = @_[HEAP, ARG0];
+
+    $heap->{flushed} = 1;
+}
+
+# Handle non-interactive user input events from POE's ReadWrite.
+sub notty_input
+{
+    my ($heap, $input, $wheel_id) = @_[HEAP, ARG0, ARG1];
+
+    # Send input to Unix socket server.
+    $heap->{readwrite}->put($input);
+}
+
+# Handle error events from non-interactive user inputs.
+sub notty_error
+{
+    my ($heap, $syscall, $errno, $error, $wheel_id) = @_[HEAP, ARG0 .. ARG3];
+
+    if ($syscall eq 'read' and $errno == 0) {
+        warn "EOF from non-interactive input\n";
+    }
+    else {
+        warn "Non-interactive input encountered $syscall error $errno: $error";
+    }
+
+    # Cleaning
+    delete $heap->{unix_socket};
+    delete $heap->{readwrite};
+    delete $heap->{notty};
+    delete $heap->{flushed};
+}
+
+# Handle interactive user input events from POE's ReadLine.
+sub tty_input
+{
+    my ($heap, $input, $exception) = @_[HEAP, ARG0, ARG1];
+
+    if (defined $input) {
+        $readline->addhistory($input);
+
+        # Send input to Unix socket server.
+        $heap->{readwrite}->put($input);
+    }
+    # Exit cleanly after Ctrl+c and Ctrl+d inputs.
+    elsif ($exception =~ /\A(?> eot | interrupt)\z/x) {
+        $readline = '';
+        delete $heap->{readwrite};
+        return;
+    }
+
+    $readline->get('> ');
+}
+
+# POE
+#
+# Initialize POE framework objects.
+sub init_poe
+{
+    # Create the unixclt's POE session.
+    POE::Session->create(
+        package_states => [
+            main => [
+                qw<
+                    _start
+                    socket_connected
+                    socket_error
+                    socket_input
+                    socket_flushed
+                    tty_input
+                    notty_input
+                >
+            ],
+        ],
+    ) or die "failed to create ${prog}'s POE session $!";
+}
+
+sub set_options
+{
+    # Transform options warn messages.
+    local $SIG{__WARN__} = sub {
+        chomp (my $msg = shift);
+
+        if ($msg =~ /\AUse of uninitialized value /) {
+            print $msg;
+            return;
+        }
+
+        $msg =~ tr/"/'/;
+        err 2, "\L$msg\E";
+    };
+
+    GetOptions(
+        'help|h'    => sub { print $usage; exit 0 },
+        'version|v' => sub { print "$prog ${prog_ver}\n"; exit 0 },
+    );
+}
+
+set_options();
+init_poe();
+$poe_kernel->run();

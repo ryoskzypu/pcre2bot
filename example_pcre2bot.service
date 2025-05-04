@@ -4,6 +4,9 @@
 #   Run pcre2bot daemonized as systemd user service.
 #
 # Usage:
+#   mkdir -p $HOME/pcre2bot/irclogs
+#   mkdir -p /tmp/pcre2bot
+#
 #   Enable and start its service:
 #     systemctl --user enable --now pcre2bot.service
 #   Get status:
@@ -30,8 +33,12 @@
 #       systemctl --user import-environment NICKSERV_PASS
 #       systemctl start pcre2bot
 #
-#   - A terminal multiplexer like tmux could be used to start pcre2bot in 'ExecStart=',
-#     so its session can be reattached and the bot reused interactively.
+#   - unixclt can be used to send /commands to pcre2bot via Unix socket, or socat
+#     (e.g. printf '%s\n' /connect | socat - UNIX-CONNECT:/tmp/pcre2bot/pcre2bot-unix-socket).
+#     See unixclt --help for info.
+#
+#     Also, a terminal multiplexer like tmux could be used to start pcre2bot in
+#     'ExecStart=', so its session can be reattached and the bot reused interactively.
 #
 # References:
 #   https://systemd.io/
@@ -50,7 +57,7 @@ After=network-online.target
 [Service]
 
 Type=exec
-ExecStart=%h/pcre2bot/pcre2bot --auto-conn %h/pcre2bot/example_pcre2bot.toml
+ExecStart=%h/pcre2bot/pcre2bot --auto-conn --unix --debug %h/pcre2bot/example_pcre2bot.toml
 
 StandardOutput=null
 StandardError=journal
@@ -65,6 +72,9 @@ StandardError=journal
 # Note that pcre2bot's CPU and memory usage is small, so it should not go beyond
 # the configured options values, unless pcre2test's output is very large and the
 # max_paste_lines value high enough to hold that.
+
+# Lower pcre2bot's scheduling priority.
+Nice=2
 
 # Ensure that pcre2bot never gets more than N% CPU time on one CPU.
 CPUQuota=60%
@@ -88,13 +98,14 @@ MemorySwapMax=0
 #
 # Notes:
 #   - If logging is enabled and the log filepath is different than ~/pcre2bot/irclogs,
-#     it will need to be set in 'ReadWritePaths='.
+#     it will need to be set in 'ReadWritePaths=' or in a whitelist (e.g. 'TemporaryFileSystem=/tmp',
+#     'BindPaths=/tmp/irclogs').
 
 ProtectSystem=strict
 ProtectProc=invisible
 RestrictSUIDSGID=true
 
-# Hide /home directory while allowing ~/.config/environment.d (drop-in dir used
+# Hide $HOME directory while allowing ~/.config/environment.d (drop-in dir used
 # to export env vars to systemd user instances) and ~/perl5 (perlbrew's dir)
 # directories to be readable; also ~/pcre2bot read-writeable.
 #
@@ -109,9 +120,12 @@ TemporaryFileSystem=%h/
 BindReadOnlyPaths=%h/.config/environment.d/ %h/perl5/
 BindPaths=%h/pcre2bot/
 
+# Hide /tmp while allowing /tmp/pcre2bot directory to be used for the Unix socket file.
+TemporaryFileSystem=/tmp
+BindPaths=/tmp/pcre2bot/
+
 PrivateDevices=true
 PrivateMounts=true
-PrivateTmp=true
 PrivateUsers=true
 
 CapabilityBoundingSet=
