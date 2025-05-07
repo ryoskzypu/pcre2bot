@@ -1,0 +1,50 @@
+# example_pcre2bot_logrotate — pcre2bot's logrotate conf file example
+#
+# Description:
+#   Manage pcre2bot's rotation of its logs with logrotate.
+#
+# Usage:
+#   Make sure logrotate is installed and this file is installed in /etc/logrotate.d
+#   with root permissions.
+#   Also logrotate's systemd.timer or cron job must be enabled.
+#
+#   Testing:
+#     # To test the kill command and apply the changes, remove --debug option.
+#     sudo logrotate --debug --verbose -f /etc/logrotate.d/example_pcre2bot_logrotate
+#
+# Notes:
+#   In this file example, pcre2bot's log files will be rotated and compressed weekly.
+#   The rotate count is 4 and size 20M, meaning that from each log file, only 4
+#   will be kept and only be rotated if they grow bigger than 20 megabytes.
+#   After every log is rotated, a HUP signal is sent to pcre2bot to restart itself,
+#   so it can reopen its filehandles and resume writing to its log files.
+#
+#   Also, it assumes that pcre2bot is installed and executed from $HOME, so adjust
+#   the filepaths from logs section i.e '~/pcre2bot/irclogs/*.log {', and awk's
+#   regex in lastaction accordingly.
+#
+# References:
+#   https://github.com/logrotate/logrotate
+#   https://wiki.archlinux.org/title/Logrotate
+#   https://man.archlinux.org/man/logrotate.conf.5
+#   https://www.redhat.com/en/blog/setting-logrotate
+#   https://www.baeldung.com/linux/rotating-logs-logrotate
+#   https://stackoverflow.com/a/23728801
+#   https://askubuntu.com/a/598716
+
+~/pcre2bot/irclogs/*.log {
+# Replace 'su user group' with the correct user and group.
+    su user group
+    weekly
+    rotate 4
+    size 20M
+    create
+    compress
+    notifempty
+#   If pcre2bot's systemd service is used, replace the kill command in lastaction
+#   with:
+#     sudo systemctl --user --machine=your_username@.host restart pcre2bot
+    lastaction
+        kill -s HUP "$(ps -eo pid,args | awk '/^[0-9]+ perl (\/home\/[^\/]+\/pcre2bot\/|\.\/)?pcre2bot .+$/ { print $1 }')"
+    endscript
+}

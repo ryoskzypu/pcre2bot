@@ -78,6 +78,7 @@
 #   - Make sure to have enough disk space when enabling logging, because the logger
 #     just writes to its files in append mode. Also the script has no logrotate
 #     mechanism, so the user has to take care of files management.
+#     See example_pcre2bot_logrotate.
 #
 #   - pcre2bot has no mechanism to reload its config file in-place, because the
 #     bot has to reconnect to apply the changes anyway.
@@ -88,9 +89,6 @@
 #   - Study the IRC protocol basics.
 #   - Study POE, and POE::Component::IRC, Mojo::IRC, AnyEvent::IRC.
 #   - Study perlbot, shbot, and greybot to get ideias of useful features to implement.
-#
-#   - Add a log rotation to the logs with logrotate, document it, and provide
-#     an example config.
 #
 #   - Study on how to implement perl modules/packages to the script, because it's
 #     too long.
@@ -115,8 +113,8 @@ use v5.26.0;
 
 use strict;
 use warnings;
-use sigtrap 'handler' => \&sig_handler, qw< TERM >;  # Handle TERM signal sent by systemctl's stop/restart.
-use open    qw< :std :encoding(UTF-8) >;             # Encode STDIN, STDOUT and STDERR to UTF-8.
+use sigtrap 'handler' => \&sig_handler, qw< HUP TERM >;  # Handle HUP and TERM signals.
+use open    qw< :std :encoding(UTF-8) >;                 # Encode STDIN, STDOUT and STDERR to UTF-8.
 
 use I18N::Langinfo        qw< langinfo CODESET >;
 use Encode                qw< decode >;
@@ -161,6 +159,10 @@ my $irc;
 my $readline;
 my $curl;
 
+# Signals
+my $restart = 0;  # HUP
+my @exec_pcre2bot;
+
 # Handle signals.
 sub sig_handler
 {
@@ -168,8 +170,36 @@ sub sig_handler
 
     # Exit cleanly if SIGTERM is caught, e.g. via 'systemctl stop pcre2bot.service'.
     if ($sig_name eq 'TERM') {
-        warn "Signal '${sig_name}' caught. Exiting.\n";
+        warn "Signal '${sig_name}' caught. Exiting $prog.\n";
         $irc->yield('shutdown') if defined $irc;
+    }
+    # Restart pcre2bot if SIGHUP is caught, e.g. via logrotate.
+    elsif ($sig_name eq 'HUP') {
+        $restart = 1;
+
+        warn "Signal '${sig_name}' caught. Restarting $prog.\n";
+
+        # Get pcre2bot's process ID.
+        my $pid = $$;
+        pdbg("\$pid: $pid");
+
+        # Get pcre2bot's command line args.
+        open my $fh, '<', "/proc/$pid/cmdline";
+        my $pid_cmdline = <$fh>;
+        close $fh or warn $!;
+
+        $pid_cmdline =~ s/\0/\x{20}/g;  # Replace NULs with spaces.
+        pdbg("\$pid_cmdline: $pid_cmdline");
+
+        @exec_pcre2bot = split / /, $pid_cmdline;
+
+        if ($irc->connected) {
+            $irc->yield('quit')
+        } else {
+            $readline = '';
+            $restart  = 0;
+            exec @exec_pcre2bot;
+        }
     }
 }
 
@@ -1876,6 +1906,13 @@ sub irc_quit
 
         # Do not reconnect bot on manual /quit.
         $irc->plugin_del('Connector');
+    }
+
+    # Restart pcre2bot on HUP signal.
+    if ($restart) {
+        $readline = '';
+        $restart  = 0;
+        exec @exec_pcre2bot;
     }
 
     return;

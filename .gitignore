@@ -12,3 +12,6 @@
 
 # Ignore pcre2bot.profile firejail profile "
 /pcre2bot.profile
+
+# Ignore pcre2bot_logrotate conf file "
+/pcre2bot_logrotate
