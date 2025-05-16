@@ -25,6 +25,8 @@
 # TODO:
 #   - Create a module to store the completions, to avoid repetition.
 
+use v5.26.0;
+
 use strict;
 use warnings;
 
@@ -41,14 +43,14 @@ use POE          qw<
 
 $|++;  # Disable STDOUT buffering.
 
-my $prog     = basename $0;
-my $prog_ver = '0.1';
+my $PROG     = basename $0;
+my $PROG_VER = '0.1';
 
 # Wheter script is running interactively, i.e. connected to a TTY.
 my $interactive = (-t STDIN && -t STDOUT ? 1 : 0);
 
 # The Unix socket filepath where the client connects to, and the server listens to.
-my $rendezvous = '/tmp/pcre2bot/pcre2bot-unix-socket';
+my $RENDEZVOUS = '/tmp/pcre2bot/pcre2bot-unix-socket';
 
 my $readline;  # POE's ReadLine
 
@@ -65,8 +67,8 @@ local $SIG{__WARN__} = sub {
     }
 };
 
-my $usage = <<~"END";
-    Usage: $prog [OPTION]...
+my $USAGE = <<~"END";
+    Usage: $PROG [OPTION]...
     pcre2bot's Unix socket client
     Connect to pcre2bot's Unix socket server and send /commands.
 
@@ -76,14 +78,14 @@ my $usage = <<~"END";
 
     Examples:
       run unixclt interactively:
-        $prog
+        $PROG
 
       run unixclt non-interactively:
-        printf '%s\\n' /connect '/msg #pcre2bot hi' | $prog
+        printf '%s\\n' /connect '/msg #pcre2bot hi' | $PROG
     END
 
 # pcre2bot's input /commands
-my @commands = (
+my @COMMANDS = (
     '/admin ',
     '/away ',
     '/ban ',
@@ -169,7 +171,7 @@ sub err
 {
     my ($code, $msg) = @_;
 
-    print STDERR "${prog}: ${msg}\n";
+    print STDERR "${PROG}: ${msg}\n";
 
     $readline = '';
     exit $code;
@@ -184,7 +186,7 @@ sub _start
     # Create the SocketFactory object that will connect a Unix socket to the server.
     $heap->{unix_socket} = POE::Wheel::SocketFactory->new(
         SocketDomain  => AF_UNIX,
-        RemoteAddress => $rendezvous,
+        RemoteAddress => $RENDEZVOUS,
         SuccessEvent  => 'socket_connected',
         FailureEvent  => 'socket_error',
     );
@@ -227,7 +229,7 @@ sub socket_connected
         $attribs->{completion_function} = sub {
             my ($text, $line, $start) = @_;
 
-            return @commands;
+            return @COMMANDS;
         };
 
         # Prompt for input.
@@ -241,7 +243,7 @@ sub socket_error
     my ($heap, $syscall, $errno, $error, $wheel_id) = @_[HEAP, ARG0 .. ARG3];
     $error = 'Normal disconnection' unless $errno;
 
-    warn "Client socket encountered $syscall error $errno: $error";
+    warn "Client socket encountered $syscall error ${errno}: $error";
 
     # Cleaning
     delete $heap->{unix_socket};
@@ -301,7 +303,7 @@ sub notty_error
         warn "EOF from non-interactive input\n";
     }
     else {
-        warn "Non-interactive input encountered $syscall error $errno: $error";
+        warn "Non-interactive input encountered $syscall error ${errno}: $error";
     }
 
     # Cleaning
@@ -352,7 +354,7 @@ sub init_poe
                 >
             ],
         ],
-    ) or die "failed to create ${prog}'s POE session $!";
+    ) or die "failed to create ${PROG}'s POE session: $!";
 }
 
 sub set_options
@@ -371,8 +373,8 @@ sub set_options
     };
 
     GetOptions(
-        'help|h'    => sub { print $usage; exit 0 },
-        'version|v' => sub { print "$prog ${prog_ver}\n"; exit 0 },
+        'help|h'    => sub { print $USAGE; exit 0 },
+        'version|v' => sub { print "$PROG ${PROG_VER}\n"; exit 0 },
     );
 }
 

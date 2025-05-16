@@ -62,7 +62,7 @@
 #   - https://wooledge.org/~greybot/
 #   - https://github.com/troydm/shellbot
 #   - BinGOs, Mathizen, and folks from #perl on Libera (vague, huf, Grinnz, mauke,
-#     Botje), OnlineCop #regex on Libera.
+#     Botje, monkfish), OnlineCop #regex on Libera.
 #
 # Notes:
 #   - Unfortunately to get TLS support, POE::Component::SSLify has to be force
@@ -92,6 +92,7 @@
 #
 #   - Study on how to implement perl modules/packages to the script, because it's
 #     too long.
+#     Create a makefile to install all files, or use ExtUtils::MakeMaker.
 #
 #   - Try to connect the bot with Tor. SOCKS5 is not supported, so maybe open a
 #     feature issue to PoCo-IRC?
@@ -101,7 +102,6 @@
 #   - Maybe add netcat support for pastebin services, so services that rely on
 #     'nc' can be used.
 #   - Add bash tab completions.
-#   - Create a makefile to install all files, or use ExtUtils::MakeMaker.
 #
 #   - Study ways of how the bot can be deployed in a server.
 #   - After POE script is done, maybe try to reimplement it with another framework,
@@ -114,10 +114,11 @@ use v5.26.0;
 use strict;
 use warnings;
 use sigtrap 'handler' => \&sig_handler, qw< HUP TERM >;  # Handle HUP and TERM signals.
-use open    qw< :std :encoding(UTF-8) >;                 # Encode STDIN, STDOUT and STDERR to UTF-8.
+use open    qw< :std :encoding(UTF-8) >;                 # Encode STDIN, STDOUT, STDERR, and filehandles to UTF-8.
+use feature qw< unicode_strings >;
 
 use I18N::Langinfo        qw< langinfo CODESET >;
-use Encode                qw< decode >;
+use Encode                qw< encode decode FB_CROAK LEAVE_SRC >;
 use File::Basename;
 use Getopt::Long          qw< GetOptions :config gnu_getopt >;
 use TOML::Tiny            qw< from_toml >;
@@ -133,7 +134,7 @@ use POE                   qw<
                               Component::IRC::Plugin::Logger
                           >;
                              #Component::Curl::Multi  # PoCo-Curl is failing to build for latest libcurl because of Net::Curl header issue, re-add it when upstream fix it.
-use IRC::Utils            qw< parse_user matches_mask >;
+use IRC::Utils            qw< parse_user matches_mask decode_irc >;
 use HTTP::Request::Common qw< POST >;
 use Socket                qw< PF_UNIX >;
 use Data::Dumper          qw< Dumper >;
@@ -151,8 +152,8 @@ END { close STDOUT or die $! }
 
 $|++;  # Disable STDOUT buffering.
 
-my $prog     = basename $0;
-my $prog_ver = '0.1';
+my $PROG     = basename $0;
+my $PROG_VER = '0.1';
 
 # POE
 my $irc;
@@ -170,21 +171,21 @@ sub sig_handler
 
     # Exit cleanly if SIGTERM is caught, e.g. via 'systemctl stop pcre2bot.service'.
     if ($sig_name eq 'TERM') {
-        warn "Signal '${sig_name}' caught. Exiting $prog.\n";
+        warn "Signal '${sig_name}' caught. Exiting ${PROG}.\n";
         $irc->yield('shutdown') if defined $irc;
     }
     # Restart pcre2bot if SIGHUP is caught, e.g. via logrotate.
     elsif ($sig_name eq 'HUP') {
         $restart = 1;
 
-        warn "Signal '${sig_name}' caught. Restarting $prog.\n";
+        warn "Signal '${sig_name}' caught. Restarting ${PROG}.\n";
 
         # Get pcre2bot's process ID.
         my $pid = $$;
         pdbg("\$pid: $pid");
 
         # Get pcre2bot's command line args.
-        open my $fh, '<', "/proc/$pid/cmdline";
+        open my $fh, '<', "/proc/${pid}/cmdline";
         my $pid_cmdline = <$fh>;
         close $fh or warn $!;
 
@@ -216,8 +217,8 @@ local $SIG{__WARN__} = sub {
     }
 };
 
-my $usage = <<~"END";
-    Usage: $prog [OPTION]... CONFIG_FILE
+my $USAGE = <<~"END";
+    Usage: $PROG [OPTION]... CONFIG_FILE
     pcre2test IRC bot
     IRC bot that listens to specific user commands in a IRC channel, sends them
     to pcre2test, then runs regex tests and displays its results in the channel.
@@ -231,10 +232,10 @@ my $usage = <<~"END";
       -v, --version         show version info and exit
 
     Examples:
-      $prog --ac CONFIG_FILE
+      $PROG --ac CONFIG_FILE
     END
 
-my $commands = <<~'END';
+my $COMMANDS = <<~'END';
     Commands:
       For the complete description of PoCo-IRC commands, see https://metacpan.org/pod/POE::Component::IRC#INPUT-EVENTS,
       and https://en.wikipedia.org/wiki/List_of_Internet_Relay_Chat_commands.
@@ -320,7 +321,7 @@ my $commands = <<~'END';
     END
 
 # Input /commands
-my @commands = (
+my @COMMANDS = (
     '/admin ',
     '/away ',
     '/ban ',
@@ -446,11 +447,11 @@ my $fullnick;  # nick!~user@host
 my @lines;
 
 # Regexes
-my $num_rgx       = qr/\A\d++\z/;
-my $pcre2_ver_rgx = qr/\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/;
-my $delimiter_rgx = qr{[/!"'`=_:;,%&@~-]}x;
-my $mod_short_rgx = qr/\b(?> [agimnrsBI]++ | x{1,2}+)++\b/x;
-my $commands_rgx  = qr/
+my $NUM_RGX       = qr/\A\d++\z/a;
+my $PCRE2_VER_RGX = qr/\APCRE2 version \d{2}+\.\d{2}+ \d{4}+-\d{2}+-\d{2}+\z/a;
+my $DELIMITER_RGX = qr{[/!"'`=_:;,%&@~-]}x;
+my $MOD_SHORT_RGX = qr/\b(?> [agimnrsBI]++ | x{1,2}+)++\b/x;
+my $COMMANDS_RGX  = qr/
                         (?>
                             (?'cmd1' help) | (?'cmd2' version)
                         )
@@ -459,7 +460,7 @@ my $commands_rgx  = qr/
                     /x;
 
 # Flags
-my $interactive   = (-t STDIN && -t STDOUT ? 1 : 0);  # Wheter script is running interactively, i.e. connected to a TTY.
+my $interactive   = (-t STDIN && -t STDOUT ? 1 : 0);  # Whether script is running interactively, i.e. connected to a TTY.
 my $connected     = 0;                                # Got connected to an IRC server.
 my $was_connected = 0;                                # Was "
 my $conv_uniq     = 0;                                # Unique conversion ('replace' modifier)
@@ -473,7 +474,7 @@ sub err
 {
     my ($code, $msg) = @_;
 
-    print STDERR "${prog}: ${msg}\n";
+    print STDERR "${PROG}: ${msg}\n";
 
     $readline = '';
     exit $code;
@@ -532,7 +533,7 @@ sub plog
     my ($date, $time) = split / /, (strftime '%Y-%m-%d %H:%M:%S ', localtime);
     my $new_msg       = ($get_date == 1 ? "$date $time $message" : "$time $message");
 
-    # Wheter to log irc_raw* events to 'raw.log' or main events to 'main.log'.
+    # Whether to log irc_raw* events to 'raw.log' or main events to 'main.log'.
     my $fh = ($raw ? $raw_log_fh : $main_log_fh);
 
     # If pcre2bot is started non-interactively, i.e. via systemd service, do not
@@ -572,16 +573,16 @@ sub perr
                    : $irc->yield(privmsg => $channel => "${nick}${message}");
 }
 
-# Dump PRIVMSG messages for debugging.
-sub dump_privmsg
+# Dump IRC strings for debugging.
+sub dump_str
 {
-    my ($message) = @_;
-    my @bytes = split //, $message;
+    my ($string) = @_;
+    my @bytes = split //, $string;
 
     @bytes = map { conv_chars($_) } @bytes;
-    my $dumped_msg = join '', @bytes;
+    my $dumped_str = join '', @bytes;
 
-    pdbg("\$dumped_msg: '${dumped_msg}'");
+    pdbg("\$dumped_str: '${dumped_str}'");
 }
 
 # Convert non-printable chars to their escaped, octal, or hex representation.
@@ -591,7 +592,7 @@ sub conv_chars
     my $char = shift;
 
     # Decimal to escaped chars table
-    my %esc_chars = (
+    my %ESC_CHARS = (
         '0'  => '\0',
         '7'  => '\a',
         '8'  => '\b',
@@ -608,7 +609,7 @@ sub conv_chars
     }
     # Escaped
     elsif ($char =~ /\A[\x{00}\x{07}-\x{0d}]\z/) {
-        return sprintf '%s', $esc_chars{ord $char};
+        return sprintf '%s', $ESC_CHARS{ord $char};
     }
     # Printable ASCII (7-bit)
     elsif ($char =~  /\A[\x{20}-\x{7e}]\z/) {
@@ -662,7 +663,7 @@ sub check_command
 
     ($command) = $input =~ /\A([^\h]*+)\h*+/;
 
-    if (! grep { $_ =~ /\A\Q$command\E\z/ } map { (split / /, $_)[0] } @commands) {
+    if (! grep { $_ =~ /\A\Q$command\E\z/ } map { (split / /, $_)[0] } @COMMANDS) {
         return 0;
     }
 
@@ -746,7 +747,7 @@ sub _start
         $attribs->{completion_function} = sub {
             my ($text, $line, $start) = @_;
 
-            return @commands;
+            return @COMMANDS;
         };
     }
 
@@ -762,14 +763,14 @@ sub _start
     #   http://poe.perl.org/?POE_Cookbook/UNIX_Clients
     if ($unix_server) {
         # Unix socket filepath
-        my $rendezvous = "/tmp/pcre2bot/pcre2bot-unix-socket";
+        my $RENDEZVOUS = '/tmp/pcre2bot/pcre2bot-unix-socket';
 
         # Remove the socket if it exists before creating the server.
-        unlink $rendezvous if -e $rendezvous;
+        unlink $RENDEZVOUS if -e $RENDEZVOUS;
 
         $heap->{unix_server} = POE::Wheel::SocketFactory->new(
             SocketDomain => PF_UNIX,
-            BindAddress  => $rendezvous,
+            BindAddress  => $RENDEZVOUS,
             SuccessEvent => 'unix_server_accepted',
             FailureEvent => 'unix_server_error',
         );
@@ -807,7 +808,7 @@ sub _default
                           | wallops
                       )
                       \z
-                  /x) {
+                  /xa) {
         return;
     }
 
@@ -833,8 +834,10 @@ sub _default
 sub _response
 {
     my ($heap, $request_packet, $response_packet) = @_[HEAP, ARG0, ARG1];
-    my $ret_code = $response_packet->[0]->{_rc};
-    my $content  = $response_packet->[0]->{_content};
+    #my $ret_code = $response_packet->[0]->{_rc};
+    #my $content  = $response_packet->[0]->{_content};
+    my $ret_code = $response_packet->[0]{_rc};
+    my $content  = $response_packet->[0]{_content};
     $content =~ s/\n//;
 
     my $channel = $heap->{channel};
@@ -894,6 +897,7 @@ sub rw_error_state
 sub rl_handle_input
 {
     my ($kernel, $input, $exception) = @_[KERNEL, ARG0, ARG1];
+    $input = decode 'UTF-8', $input;
 
     if (defined $input) {
         $readline->addhistory($input);
@@ -1182,8 +1186,8 @@ sub parse_command
             return $rc;
         }
         elsif ($cmd eq 'help') {
-            pput(1, $_) foreach (split /\n/, $commands);
-            return $commands;
+            pput(1, $_) foreach (split /\n/, $COMMANDS);
+            return $COMMANDS;
         }
         # Kick a user from channel and ban its host.
         #   /kickban #channel nick [reason]
@@ -1431,6 +1435,16 @@ sub got_child_stdout
     my $line_cnt  = scalar @lines;
 
     pdbg("PID $child_pid STDOUT: '${stdout_line}'");
+
+    dump_str($stdout_line);
+    # Decode pcre2test's output to UTF-8, so Unicode strings are sent and shown
+    # correctly.
+    # Note that unfortunately PoCo-Logger plugin will double-encode lines that
+    # contain Unicode chars and fail, thus it will not log those lines. The raw
+    # log file shows them correctly.
+    $stdout_line = decode 'UTF-8', $stdout_line;
+    dump_str($stdout_line);
+
     pdbg("\$line_cnt: $line_cnt");
 
     return if $line_cnt == $max_paste_lines;
@@ -1446,7 +1460,7 @@ sub got_child_stdout
         elsif ($no_service) {
             # Reset lines and flag on last line.
             if ($stdout_line eq '') {
-                undef(@lines);
+                undef @lines;
                 $no_service = 0;
             }
 
@@ -1461,11 +1475,13 @@ sub got_child_stdout
             my $input = join "\n", @lines;
             $heap->{input} = $input;
 
-            get_pastebin($input);
+            # TODO: HTTP::Request only accept bytes, so re-encode input to bytes.
+            #$input = encode 'UTF-8', $input;
+            #get_pastebin($input);
         }
 
         # Reset
-        undef(@lines);
+        undef @lines;
         $conv_uniq  = 0;
         $no_service = 0;
 
@@ -1479,7 +1495,7 @@ sub got_child_stdout
         $stdout_line =~ s/\o{034} | \\x\{1c\}/,/gx if $conv_uniq;
 
         # Count all lines except the version line from command.
-        if ($stdout_line !~ $pcre2_ver_rgx && $line_cnt <= $max_paste_lines - 1) {
+        if ($stdout_line !~ $PCRE2_VER_RGX && $line_cnt <= $max_paste_lines - 1) {
             push @lines, $stdout_line;
 
             if ($line_cnt == $max_paste_lines - 1) {
@@ -1497,7 +1513,7 @@ sub got_child_stdout
         }
 
         # Ignore pcre2test's error/version messages.
-        if ($stdout_line !~ /\A\*\* [^\n]++\z/ && $stdout_line !~ $pcre2_ver_rgx) {
+        if ($stdout_line !~ /\A\*\* [^\n]++\z/ && $stdout_line !~ $PCRE2_VER_RGX) {
             if ($heap->{trigger} =~ /\A(?> default | callouts)\z/x && $line_cnt < $max_irc_lines + 1) {
                 # Ignore the first 2 lines if the trigger is a default or callout,
                 # because pattern/subject is already known to the user.
@@ -1543,7 +1559,7 @@ sub got_child_close
     pdbg("PID $child_pid closed all pipes");
 
     # Cleaning
-    undef(@lines);
+    undef @lines;
     delete $heap->{children_by_pid}{$child_pid};
     delete $heap->{channel};
     delete $heap->{nick};
@@ -1563,7 +1579,7 @@ sub got_child_signal
     return unless defined $child;
 
     # Cleaning
-    undef(@lines);
+    undef @lines;
     delete $heap->{children_by_wid}{$child->ID};
     delete $heap->{channel};
     delete $heap->{nick};
@@ -1606,6 +1622,7 @@ sub unix_server_error
 sub unix_client_input
 {
     my ($heap, $input, $wheel_id) = @_[HEAP, ARG0, ARG1];
+    $input = decode 'UTF-8', $input;
 
     plog(1, 0, 0, 0, "Received client data: $input");
 
@@ -1639,8 +1656,11 @@ sub irc_001
 
     # Request useful IRCv3 capabilities.
     #
-    # Note that the IRC server must support them. Run '/cap ls' to list the server
-    # supported capabilities.
+    # Notes:
+    #   - The IRC server must support them. Run '/cap ls' to list the server
+    #     supported capabilities.
+    #   - Unfortunately PoCo-Logger duplicates pcre2bot's messages in logs if
+    #     echo-message capability is used.
     #
     # See:
     #   https://modern.ircdocs.horse/#capability-negotiation
@@ -1653,7 +1673,6 @@ sub irc_001
             account-tag
             cap-notify
             chghost
-            echo-message
             extended-join
         >
     );
@@ -1775,6 +1794,15 @@ sub irc_raw_out
 {
     my $raw_out_msg = $_[ARG0];
 
+    #dump_str($raw_out_msg);
+
+    # Since pcre2test's output is sent as UTF-8 string, check if string fails to
+    # decode, then re-encode it to bytes to avoid encoding issues (double encoding?)
+    # when printing.
+    eval { decode 'UTF-8', $raw_out_msg, FB_CROAK|LEAVE_SRC  } or pdbg("failed to decode string: $@");
+    $raw_out_msg = encode 'UTF-8', $raw_out_msg if $@;
+    #dump_str($raw_out_msg);
+
     pmsg(1, 1, ">>> $raw_out_msg");
     return;
 }
@@ -1852,7 +1880,7 @@ sub irc_mode
 {
     my ($who, $channel, $mode) = @_[ARG0 .. ARG2];
     my $mask = "@_[ARG3 .. $#_]" // '';
-    my $nick = parse_user $who;
+    my $nick = parse_user($who);
 
     pdump('$mask', $mask);
 
@@ -1878,7 +1906,7 @@ sub irc_mode
 sub irc_join
 {
     my ($who, $channel) = @_[ARG0, ARG1];
-    my $nick = parse_user $who;
+    my $nick = parse_user($who);
 
     plog(1, 1, 0, 1, "$nick joins $channel") if $nick eq $nickname && $log_path ne '';
     return;
@@ -1889,7 +1917,7 @@ sub irc_part
 {
     my ($who, $channel) = @_[ARG0, ARG1];
     my $message = $_[ARG2] // '';
-    my $nick    = parse_user $who;
+    my $nick    = parse_user($who);
 
     plog(1, 1, 0, 1, "$nick leaves ${channel}: $message") if $nick eq $nickname && $log_path ne '';
     return;
@@ -1899,7 +1927,7 @@ sub irc_part
 sub irc_quit
 {
     my ($who, $message, $common_channels) = @_[ARG0 .. ARG2];
-    my $nick = parse_user $who;
+    my $nick = parse_user($who);
 
     if ($nick eq $nickname) {
         plog(2, 1, 0, 1, "$nick quits IRC: $message") if $log_path ne '';
@@ -1931,7 +1959,7 @@ sub irc_kick
 sub irc_nick
 {
     my ($who, $new_nick, $common_channels) = @_[ARG0 .. ARG2];
-    my $nick = parse_user $who;
+    my $nick = parse_user($who);
 
     $nickname = $new_nick if $who eq $fullnick;
     plog(1, 1, 0, 1, "$nick changes nick to $new_nick") if $log_path ne '';
@@ -1943,7 +1971,7 @@ sub irc_nick
 sub irc_topic
 {
     my ($who, $channel, $topic, $topic_old) = @_[ARG0 .. ARG3];
-    my $nick = parse_user $who;
+    my $nick = parse_user($who);
 
     pdump('$topic_old', $topic_old);
     $topic_old = $topic_old->{Value};
@@ -2030,14 +2058,25 @@ sub irc_public
 {
     # E.g. ':ryoskzypu!~ryoskzypu@user/ryoskzypu PRIVMSG #regex :pcre2bot: help'
     my ($kernel, $heap, $who, $command, $message) = @_[KERNEL, HEAP, ARG0 .. ARG2];
-    my ($nick, $user, $host) = parse_user $who;
+    my ($nick, $user, $host) = parse_user($who);
+
+    # Decode IRC strings that may contain Unicode, for correct string processing.
+    # See https://metacpan.org/pod/IRC::Utils#decode_irc.
+
+    $nick = decode_irc($nick);
+    $user = decode_irc($user);
+    $host = decode_irc($host);
+
     my $userhost = "${user}\@$host";
-    my $channel  = $command->[0];
+    my $channel  = decode_irc($command->[0]);
 
-    $heap->{channel} = $channel;
+    dump_str($message);
+    $message = decode_irc($message);
+    dump_str($message);
+
     $heap->{nick}    = "${nick}: ";
+    $heap->{channel} = $channel;
 
-    dump_privmsg($message);
     parse_privmsg($kernel, $heap, $userhost, $heap->{nick}, $channel, $message) if $nick ne $nickname && is_userhost_allowed($userhost);
 
     return;
@@ -2048,13 +2087,23 @@ sub irc_msg
 {
     # E.g. ':ryoskzypu!~ryoskzypu@user/ryoskzypu PRIVMSG pcre2bot :pcre2bot: help'
     my ($kernel, $heap, $who, undef, $message) = @_[KERNEL, HEAP, ARG0 .. ARG2];
-    my ($nick, $user, $host) = parse_user $who;
+    my ($nick, $user, $host) = parse_user($who);
+
+    # Decode IRC strings that may contain Unicode, for correct string processing.
+
+    $nick = decode_irc($nick);
+    $user = decode_irc($user);
+    $host = decode_irc($host);
+
     my $userhost = "${user}\@$host";
 
     $heap->{channel} = $nick;
     $heap->{nick}    = '';
 
-    dump_privmsg($message);
+    dump_str($message);
+    $message = decode_irc($message);
+    dump_str($message);
+
     parse_privmsg($kernel, $heap, $userhost, '', $nick, $message) if $nick ne $nickname && is_userhost_allowed($userhost);
 
     return;
@@ -2158,14 +2207,14 @@ sub parse_privmsg
                                        \A
                                        \Q$nickname\E[:,]?+
                                        \x{20}
-                                       $commands_rgx
+                                       $COMMANDS_RGX
                                        \z
                                    /x
                                    ||
         # Nick prefix before commands is not a requirement on private messages.
         ($nick eq '' && $message =~ /
                                         \A
-                                        $commands_rgx
+                                        $COMMANDS_RGX
                                         \z
                                     /x)) {
         # help
@@ -2290,7 +2339,7 @@ sub parse_privmsg
             if ($input =~ m{
                               \A
                               \h*+
-                              (?'delimiter' $delimiter_rgx)  # Pattern opening delimiter
+                              (?'delimiter' $DELIMITER_RGX)  # Pattern opening delimiter
                           }xgc) {
                 $delimiter = $+{delimiter};
             }
@@ -2299,7 +2348,7 @@ sub parse_privmsg
                                  \A
                                  \h*+
                                  s
-                                 (?'delimiter' $delimiter_rgx)
+                                 (?'delimiter' $DELIMITER_RGX)
                              }xgc) {
                 $delimiter = $+{delimiter};
                 $subst     = 1;
@@ -2403,7 +2452,7 @@ sub parse_privmsg
 
                                   # See 'pcre2test -LM' and pcre2test(1) for the complete list.
 
-                                  (?'modifier_short' $mod_short_rgx)
+                                  (?'modifier_short' $MOD_SHORT_RGX)
 
                                   (?'modifier_long'
                                       (?>
@@ -2696,7 +2745,7 @@ sub check_modifiers
     if ($list->@*) {
         # Check short modifiers.
         if ($split_mods[0] =~ /
-                                  $mod_short_rgx
+                                  $MOD_SHORT_RGX
                                   |
                                   # Force a failure on backtracking, so strings like 'replace=x'
                                   # will not match a short modifier.
@@ -2860,8 +2909,8 @@ sub set_dumper
         my $hash = shift;
 
         return [
-            join('', keys $hash->%*) =~ /\A\d+\z/ ? sort { $a <=> $b } keys $hash->%*
-                                                  : sort keys $hash->%*
+            join('', keys $hash->%*) =~ $NUM_RGX ? sort { $a <=> $b } keys $hash->%*
+                                                 : sort keys $hash->%*
         ];
     };
 }
@@ -2884,10 +2933,10 @@ sub set_options
     GetOptions(
         'auto-conn|ac' => \$auto_conn,
         'debug|d'      => \$debug,
-        'help|h'       => sub { print $usage; exit 0 },
+        'help|h'       => sub { print $USAGE; exit 0 },
         'pass|p'       => \$pass,
         'unix|u'       => \$unix_server,
-        'version|v'    => sub { print "$prog ${prog_ver}\n"; exit 0 },
+        'version|v'    => sub { print "$PROG ${PROG_VER}\n"; exit 0 },
     );
 
     if ($pass) {
@@ -2920,7 +2969,6 @@ sub init_config
     open my $fh, '<', $config_file or err 1, "failed to open $config_file";
 
     # Decode TOML config.
-
     my $toml = do { local $/; <$fh> };
     close $fh or warn $!;
     ($config, my $error) = from_toml($toml);
@@ -2936,9 +2984,9 @@ sub init_config
 # Set config TLS variable and check its certificate.
 sub set_config_tls
 {
-    $tls      = $config->{server}->{use_tls};
-    $tls_cert = $config->{server}->{tls_cert};
-    $tls_key  = $config->{server}->{tls_key};
+    $tls      = $config->{server}{use_tls};
+    $tls_cert = $config->{server}{tls_cert};
+    $tls_key  = $config->{server}{tls_key};
 
     if ($tls_cert ne '' && $tls_key eq '') {
         err 1, 'missing certificate key';
@@ -2964,42 +3012,42 @@ sub get_env_vars
 # Set config variables.
 sub set_config_vars
 {
-    $nickname      = $config->{server}->{nickname};
-    $username      = $config->{server}->{username};
-    $ircname       = $config->{server}->{ircname};
-    $usermode      = $config->{server}->{usermode};
-    $server        = $config->{server}->{server};
-    $port          = $config->{server}->{port};
-    $log_path      = $config->{server}->{log_path};
-    $log_private   = $config->{server}->{log_private};
-    $log_public    = $config->{server}->{log_public};
-    $log_raw       = $config->{server}->{log_raw};
-    $nickserv_pass = $config->{server}->{nickserv_password} if $nickserv_pass eq '' && $tls_cert eq '';
-    @channels      = ($config->{server}->{channels}->@*);
+    $nickname      = $config->{server}{nickname};
+    $username      = $config->{server}{username};
+    $ircname       = $config->{server}{ircname};
+    $usermode      = $config->{server}{usermode};
+    $server        = $config->{server}{server};
+    $port          = $config->{server}{port};
+    $log_path      = $config->{server}{log_path};
+    $log_private   = $config->{server}{log_private};
+    $log_public    = $config->{server}{log_public};
+    $log_raw       = $config->{server}{log_raw};
+    $nickserv_pass = $config->{server}{nickserv_password} if $nickserv_pass eq '' && $tls_cert eq '';
+    @channels      = ($config->{server}{channels}->@*);
 
     # Userhost lists (~user@host)
-    @userhosts_allow  = ($config->{server}->{userhosts_allow}->@*);
-    @userhosts_ignore = ($config->{server}->{userhosts_ignore}->@*);
-    @userhosts_auth   = ($config->{server}->{userhosts_auth}->@*);
+    @userhosts_allow  = ($config->{server}{userhosts_allow}->@*);
+    @userhosts_ignore = ($config->{server}{userhosts_ignore}->@*);
+    @userhosts_auth   = ($config->{server}{userhosts_auth}->@*);
 
     # Default options modifiers
-    $def_pat_mods  = $config->{pcre2test}->{pattern_modifiers};
-    $def_subj_mods = $config->{pcre2test}->{subject_modifiers};
+    $def_pat_mods  = $config->{pcre2test}{pattern_modifiers};
+    $def_subj_mods = $config->{pcre2test}{subject_modifiers};
 
     # Modifiers allow lists
-    @pat_mods_allow  = ($config->{pcre2test}->{pattern_mods_allow}->@*);
-    @subj_mods_allow = ($config->{pcre2test}->{subject_mods_allow}->@*);
+    @pat_mods_allow  = ($config->{pcre2test}{pattern_mods_allow}->@*);
+    @subj_mods_allow = ($config->{pcre2test}{subject_mods_allow}->@*);
 
     # Pastebin services
 
-    $max_irc_lines     = $config->{pcre2test}->{max_irc_lines};
-    $max_paste_lines   = $config->{pcre2test}->{max_paste_lines};
+    $max_irc_lines   = $config->{pcre2test}{max_irc_lines};
+    $max_paste_lines = $config->{pcre2test}{max_paste_lines};
 
-    err 1, "max_irc_lines value is not a number"   if $max_irc_lines   !~ $num_rgx;
-    err 1, "max_paste_lines value is not a number" if $max_paste_lines !~ $num_rgx;
+    err 1, 'max_irc_lines value is not a number'   if $max_irc_lines   !~ $NUM_RGX;
+    err 1, 'max_paste_lines value is not a number' if $max_paste_lines !~ $NUM_RGX;
 
-    $primary_service   = $config->{pcre2test}->{primary_service};
-    @fallback_services = ($config->{pcre2test}->{fallback_services}->@*);
+    $primary_service   = $config->{pcre2test}{primary_service};
+    @fallback_services = ($config->{pcre2test}{fallback_services}->@*);
 }
 
 # Open the log filehandles if config asks to log.
@@ -3008,7 +3056,7 @@ sub check_log
     if ($log_path ne '') {
         my $filepath = $log_path =~ s|/\z||r;  # Trim trailing slash.
         mkdir $filepath, 0700 or $!{EEXIST}    # Do not err if directory exists.
-                              or err 1, "failed to create directory '${filepath}': $!\n";
+                              or err 1, "failed to create directory '${filepath}': ${!}\n";
 
         open $main_log_fh, '>>', "${filepath}/main.log" or err 1, 'failed to open main.log filehandle';
         open $raw_log_fh,  '>>', "${filepath}/raw.log"  or err 1, 'failed to open raw.log filehandle' if $log_raw;
@@ -3019,7 +3067,7 @@ sub check_log
 sub check_pcre2test
 {
     # Exit with an error if pcre2test is not found on $PATH.
-    system '/bin/sh', '-c', "command -v pcre2test > /dev/null";
+    system 'command -v pcre2test > /dev/null';
 
     err 1, 'pcre2test is not installed' if (($? >> 8) > 0);
 }
@@ -3045,7 +3093,7 @@ sub init_poe
     $irc = POE::Component::IRC::State->spawn(
         %opts,
         WhoJoiners => 0,
-    ) or die "failed to create PoCo-IRC object $!";
+    ) or die "failed to create PoCo-IRC object: $!";
 
     print "$nickname ${server}\n";
     print $irc->VERSION, "\n";
@@ -3100,7 +3148,7 @@ sub init_poe
         ],
 
         heap => {irc => $irc},
-    ) or die "failed to create PoCo-IRC session $!";
+    ) or die "failed to create PoCo-IRC session: $!";
 
     # Create a PoCo-Curl object.
     #$curl = POE::Component::Curl::Multi->spawn(
@@ -3108,7 +3156,7 @@ sub init_poe
     #    timeout         => 15,
     #    agent           => 'curl/8.12.1',
     #    max_concurrency => 10,
-    #) or die "failed to create PoCo-Curl object $!";
+    #) or die "failed to create PoCo-Curl object: $!";
 }
 
 END {
